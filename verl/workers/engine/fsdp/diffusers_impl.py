@@ -19,8 +19,10 @@ import gc
 import json
 import logging
 import os
+import time
 import warnings
 from contextlib import contextmanager, nullcontext
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import torch
@@ -70,6 +72,11 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _engine_sync_log(stage: str, message: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    print(f"[EngineSync][{ts}][{stage}] {message}", flush=True)
 
 
 @EngineRegistry.register(model_type="diffusion_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
@@ -849,9 +856,15 @@ class DiffusersFSDPEngine(BaseEngine):
             offload_fsdp_optimizer(self.optimizer)
 
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
+        t0 = time.monotonic()
+        stage = f"diffusers_engine.get_per_tensor_param/rank={self.rank}/base_sync_done={base_sync_done}"
+        _engine_sync_log(stage, f"START layered_summon={layered_summon}")
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
+        t_load_gpu = time.monotonic()
+        _engine_sync_log(stage, "load_fsdp_model_to_gpu START")
         load_fsdp_model_to_gpu(self.module)
+        _engine_sync_log(stage, f"load_fsdp_model_to_gpu END elapsed={time.monotonic() - t_load_gpu:.3f}s")
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
@@ -862,26 +875,47 @@ class DiffusersFSDPEngine(BaseEngine):
         if hasattr(peft_model, "peft_config"):  # LoRA
             if not merge_lora:
                 peft_config = peft_model.peft_config.get("default", None)
+                _engine_sync_log(stage, "collect_lora_params START")
+                t_collect = time.monotonic()
                 params = collect_lora_params(
                     module=self.module,
                     layered_summon=layered_summon,
                     base_sync_done=base_sync_done,
                     is_diffusers=True,
                 )
+                _engine_sync_log(
+                    stage,
+                    f"collect_lora_params END elapsed={time.monotonic() - t_collect:.3f}s n_params={len(params)}",
+                )
                 if not base_sync_done:
                     params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
             else:  # merge lora
+                _engine_sync_log(stage, "state_dict(merged_lora_context) START")
+                t_sd = time.monotonic()
                 with merged_lora_context(self.module, backup_adapters=True):
                     params = self.module.state_dict()
                     params = normalize_peft_param_name(params)
+                _engine_sync_log(
+                    stage,
+                    f"state_dict(merged_lora_context) END elapsed={time.monotonic() - t_sd:.3f}s n_params={len(params)}",
+                )
         else:
+            _engine_sync_log(stage, "module.state_dict START")
+            t_sd = time.monotonic()
             params = self.module.state_dict()
+            _engine_sync_log(stage, f"module.state_dict END elapsed={time.monotonic() - t_sd:.3f}s n_params={len(params)}")
 
+        t_convert = time.monotonic()
+        _engine_sync_log(stage, "convert_weight_keys START")
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
+        _engine_sync_log(stage, f"convert_weight_keys END elapsed={time.monotonic() - t_convert:.3f}s n_params={len(params)}")
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._is_offload_param:
+            t_offload = time.monotonic()
+            _engine_sync_log(stage, "offload_fsdp_model_to_cpu START")
             offload_fsdp_model_to_cpu(self.module)
+            _engine_sync_log(stage, f"offload_fsdp_model_to_cpu END elapsed={time.monotonic() - t_offload:.3f}s")
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         if peft_config is not None and base_sync_done:
@@ -906,6 +940,10 @@ class DiffusersFSDPEngine(BaseEngine):
         # thus we need to add the prefix
         per_tensor_param = ((f"transformer.{name}", tensor) for name, tensor in per_tensor_param)
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
+        _engine_sync_log(
+            stage,
+            f"END elapsed={time.monotonic() - t0:.3f}s peft_config={'yes' if peft_config_dict is not None else 'no'}",
+        )
         return per_tensor_param, peft_config_dict
 
     @contextmanager

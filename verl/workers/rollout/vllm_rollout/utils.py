@@ -20,6 +20,8 @@ import platform
 import signal
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from multiprocessing import shared_memory
 from types import MethodType
 from typing import Any, Callable, Literal, TypedDict, get_args
@@ -71,6 +73,11 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+
+
+def _worker_sync_log(stage: str, message: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    print(f"[WorkerSync][{ts}][{stage}] {message}", flush=True)
 
 
 def set_death_signal():
@@ -224,6 +231,9 @@ class vLLMColocateWorkerExtension:
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
+        start_time = time.time()
+        log_prefix = f"{self.__class__.__name__}.update_weights_from_ipc/device={self.device}"
+        _worker_sync_log(log_prefix, f"START peft={peft_config is not None} base_sync_done={base_sync_done} use_shm={use_shm}")
         from vllm.platforms import current_platform
 
         if current_platform.device_type == "npu" and self.device is None:
@@ -239,18 +249,27 @@ class vLLMColocateWorkerExtension:
             self._zmq_ctx = zmq.Context()
         socket = self._zmq_ctx.socket(zmq.REP)
         socket.connect(self._get_zmq_handle())
+        _worker_sync_log(log_prefix, f"zmq_connect={self._get_zmq_handle()}")
 
+        _worker_sync_log(log_prefix, "recv_comm_metadata START")
         comm_metadata = socket.recv_pyobj()
+        _worker_sync_log(log_prefix, "recv_comm_metadata END")
         buffer, shm = None, None
         if not use_shm:
             handle = comm_metadata
+            _worker_sync_log(log_prefix, "rebuild_ipc START")
             buffer = rebuild_ipc(handle, self.device.index)
             assert buffer.dtype == torch.uint8
+            _worker_sync_log(log_prefix, "rebuild_ipc END")
         else:
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
+            _worker_sync_log(log_prefix, f"rebuild_shm START name={shm_name} size={shm_size}")
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
+            _worker_sync_log(log_prefix, "rebuild_shm END")
+        _worker_sync_log(log_prefix, "send_ack_after_comm_metadata START")
         socket.send(b"")
+        _worker_sync_log(log_prefix, "send_ack_after_comm_metadata END")
 
         use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
             self.model_runner.vllm_config
@@ -267,8 +286,15 @@ class vLLMColocateWorkerExtension:
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
         # receive bucket and update weights
+        bucket_idx = 0
+        total_tensors = 0
         while True:
+            _worker_sync_log(log_prefix, f"recv_bucket START idx={bucket_idx}")
             metadata = socket.recv_pyobj()
+            _worker_sync_log(
+                log_prefix,
+                f"recv_bucket END idx={bucket_idx} tensors={len(metadata['bucket_meta'])} is_last={metadata['is_last']}",
+            )
             weights, tensor = [], None
             for name, meta in metadata["bucket_meta"].items():
                 shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
@@ -283,11 +309,17 @@ class vLLMColocateWorkerExtension:
                     tensor = tensor.to(self.device)
                 weights.append((name, tensor))
             get_torch_device().synchronize()
+            _worker_sync_log(log_prefix, f"send_bucket_ack START idx={bucket_idx}")
             socket.send(b"")
+            _worker_sync_log(log_prefix, f"send_bucket_ack END idx={bucket_idx}")
+            _worker_sync_log(log_prefix, f"_update_weights START idx={bucket_idx}")
             self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            _worker_sync_log(log_prefix, f"_update_weights END idx={bucket_idx}")
+            total_tensors += len(weights)
             del weights, tensor
             if metadata["is_last"]:
                 break
+            bucket_idx += 1
 
         if self._is_qat_model:
             # QAT: call process_weights_after_loading AFTER all buckets are received
@@ -301,7 +333,9 @@ class vLLMColocateWorkerExtension:
 
             model = self.model_runner.model
             model_config = self.model_runner.vllm_config.model_config
+            _worker_sync_log(log_prefix, "process_weights_after_loading START")
             process_weights_after_loading(model, model_config, self.device)
+            _worker_sync_log(log_prefix, "process_weights_after_loading END")
 
         # clean up
         socket.close()
@@ -313,8 +347,13 @@ class vLLMColocateWorkerExtension:
         gc.collect()
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+        _worker_sync_log(
+            log_prefix,
+            f"END elapsed={time.time() - start_time:.3f}s total_buckets={bucket_idx + 1} total_tensors={total_tensors}",
+        )
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+        start_time = time.time()
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -324,7 +363,9 @@ class vLLMColocateWorkerExtension:
                 peft_config=peft_config,
                 lora_tensors=weights,
             )
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", f"add_lora START n={len(weights)}")
             self.add_lora(lora_request)
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", "add_lora END")
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
@@ -332,11 +373,19 @@ class vLLMColocateWorkerExtension:
             if is_fp8_model(self.model_runner.vllm_config):
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
+                _worker_sync_log(self.__class__.__name__ + "._update_weights", f"load_quanted_weights START n={len(weights)}")
                 loaded_params = load_quanted_weights(weights, self.model_runner)
+                _worker_sync_log(
+                    self.__class__.__name__ + "._update_weights",
+                    f"load_quanted_weights END loaded={len(loaded_params)}",
+                )
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
+                _worker_sync_log(self.__class__.__name__ + "._update_weights", f"model.load_weights START n={len(weights)}")
                 self.model_runner.model.load_weights(weights)
+                _worker_sync_log(self.__class__.__name__ + "._update_weights", "model.load_weights END")
+        _worker_sync_log(self.__class__.__name__ + "._update_weights", f"END elapsed={time.time() - start_time:.3f}s")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
@@ -374,6 +423,9 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
+        start_time = time.time()
+        log_prefix = f"{self.__class__.__name__}.update_weights_from_ipc/device={self.device}"
+        _worker_sync_log(log_prefix, f"START peft={peft_config is not None} base_sync_done={base_sync_done} use_shm={use_shm}")
         from vllm.platforms import current_platform
 
         if current_platform.device_type == "npu" and self.device is None:
@@ -389,22 +441,38 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             self._zmq_ctx = zmq.Context()
         socket = self._zmq_ctx.socket(zmq.REP)
         socket.connect(self._get_zmq_handle())
+        _worker_sync_log(log_prefix, f"zmq_connect={self._get_zmq_handle()}")
 
+        _worker_sync_log(log_prefix, "recv_comm_metadata START")
         comm_metadata = socket.recv_pyobj()
+        _worker_sync_log(log_prefix, "recv_comm_metadata END")
         buffer, shm = None, None
         if not use_shm:
             handle = comm_metadata
+            _worker_sync_log(log_prefix, "rebuild_ipc START")
             buffer = rebuild_ipc(handle, self.device.index)
             assert buffer.dtype == torch.uint8
+            _worker_sync_log(log_prefix, "rebuild_ipc END")
         else:
             shm_name = comm_metadata["name"]
             shm_size = comm_metadata["size"]
+            _worker_sync_log(log_prefix, f"rebuild_shm START name={shm_name} size={shm_size}")
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
+            _worker_sync_log(log_prefix, "rebuild_shm END")
+        _worker_sync_log(log_prefix, "send_ack_after_comm_metadata START")
         socket.send(b"")
+        _worker_sync_log(log_prefix, "send_ack_after_comm_metadata END")
 
         # receive bucket and update weights
+        bucket_idx = 0
+        total_tensors = 0
         while True:
+            _worker_sync_log(log_prefix, f"recv_bucket START idx={bucket_idx}")
             metadata = socket.recv_pyobj()
+            _worker_sync_log(
+                log_prefix,
+                f"recv_bucket END idx={bucket_idx} tensors={len(metadata['bucket_meta'])} is_last={metadata['is_last']}",
+            )
             weights, tensor = [], None
             for name, meta in metadata["bucket_meta"].items():
                 shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
@@ -419,11 +487,17 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                     tensor = tensor.to(self.device)
                 weights.append((name, tensor))
             get_torch_device().synchronize()
+            _worker_sync_log(log_prefix, f"send_bucket_ack START idx={bucket_idx}")
             socket.send(b"")
+            _worker_sync_log(log_prefix, f"send_bucket_ack END idx={bucket_idx}")
+            _worker_sync_log(log_prefix, f"_update_weights START idx={bucket_idx}")
             self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            _worker_sync_log(log_prefix, f"_update_weights END idx={bucket_idx}")
+            total_tensors += len(weights)
             del weights, tensor
             if metadata["is_last"]:
                 break
+            bucket_idx += 1
 
         # clean up
         socket.close()
@@ -435,8 +509,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         gc.collect()
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
+        _worker_sync_log(
+            log_prefix,
+            f"END elapsed={time.time() - start_time:.3f}s total_buckets={bucket_idx + 1} total_tensors={total_tensors}",
+        )
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+        start_time = time.time()
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = OmniTensorLoRARequest(
@@ -446,11 +525,16 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
                 peft_config=peft_config,
                 lora_tensors=weights,
             )
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", f"add_lora START n={len(weights)}")
             self.add_lora(lora_request)
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", "add_lora END")
             logger.info(f"vLLM-Omni load weights, loaded_params: {len(weights)}")
         else:
             logger.info("Loading standard weights (async)")
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", f"load_weights START n={len(weights)}")
             self.load_weights(weights)
+            _worker_sync_log(self.__class__.__name__ + "._update_weights", "load_weights END")
+        _worker_sync_log(self.__class__.__name__ + "._update_weights", f"END elapsed={time.time() - start_time:.3f}s")
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""

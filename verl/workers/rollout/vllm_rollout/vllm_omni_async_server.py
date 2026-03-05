@@ -27,6 +27,7 @@ from ray.actor import ActorHandle
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTokensPrompt
 from vllm_omni.entrypoints import AsyncOmni
 from vllm_omni.entrypoints.openai.api_server import build_app, omni_init_app_state
 from vllm_omni.lora.request import LoRARequest
@@ -429,33 +430,105 @@ class vLLMOmniHttpServer:
             else:
                 vllm_omni_sampling_params["extra_args"][k] = v
 
+        # vLLM-Omni 0.10 expects prompt + sampling_params_list API.
+        sampling_params_obj = OmniDiffusionSamplingParams(**vllm_omni_sampling_params)
+        prompt = OmniTokensPrompt(prompt_token_ids=prompt_ids)
+        if multi_modal_data:
+            prompt["multi_modal_data"] = multi_modal_data
+        if negative_prompt_ids is not None:
+            prompt["negative_prompt"] = ""
+            prompt["negative_prompt_token_ids"] = negative_prompt_ids
+
         generator = self.engine.generate(
-            prompt="",  # TODO (mike): drop empty prompt
-            prompt_ids=prompt_ids,
+            prompt=prompt,
             request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-            negative_prompt_ids=negative_prompt_ids,
-            **vllm_omni_sampling_params,
+            sampling_params_list=[sampling_params_obj],
+            output_modalities=["image"],
         )
 
-        # Get final response
+        # Get final response. Some vLLM-Omni versions only expose diffusion tensors
+        # on intermediate outputs, so we cache the last non-empty payload seen.
         final_res: Optional[OmniRequestOutput] = None
+        cached_diffusion_output = None
+        cached_multimodal_output = None
+        cached_metrics = None
+        cached_latents = None
         async for output in generator:
             final_res = output
+            req_out = getattr(output, "request_output", None)
+            maybe_diff = getattr(req_out, "diffusion_output", None) if req_out is not None else None
+            if isinstance(maybe_diff, dict) and len(maybe_diff) > 0:
+                cached_diffusion_output = maybe_diff
+            maybe_mm = getattr(output, "multimodal_output", None)
+            if isinstance(maybe_mm, dict) and len(maybe_mm) > 0:
+                cached_multimodal_output = maybe_mm
+            maybe_metrics = getattr(output, "metrics", None)
+            if isinstance(maybe_metrics, dict) and len(maybe_metrics) > 0:
+                cached_metrics = maybe_metrics
+            maybe_latents = getattr(output, "latents", None)
+            if maybe_latents is not None:
+                cached_latents = maybe_latents
         assert final_res is not None
 
         image = (self._to_tensor(final_res.images[0]) / 255.0).tolist()
+
+        # vLLM-Omni response schema changed across versions.
+        # Old versions expose diffusion tensors at final_res.request_output.diffusion_output.
+        # New versions expose top-level fields (latents/metrics/multimodal_output).
+        request_output = getattr(final_res, "request_output", None)
+        diffusion_output = getattr(request_output, "diffusion_output", None) if request_output is not None else None
+        multimodal_output = getattr(final_res, "multimodal_output", {}) or {}
+
+        def _unwrap_first(x):
+            if x is None:
+                return None
+            if isinstance(x, (list, tuple)) and len(x) > 0:
+                return x[0]
+            return x
+
+        if diffusion_output is None:
+            metrics = (getattr(final_res, "metrics", {}) or {})
+            if (not multimodal_output) and cached_multimodal_output:
+                multimodal_output = cached_multimodal_output
+            if (not metrics) and cached_metrics:
+                metrics = cached_metrics
+            logger.info(
+                "[vLLMOmni] diffusion_output missing on request_output; using OmniRequestOutput fallback "
+                "keys=%s metrics=%s cached_diffusion=%s",
+                sorted(multimodal_output.keys()),
+                sorted(metrics.keys()),
+                cached_diffusion_output is not None,
+            )
+            diffusion_output = cached_diffusion_output or multimodal_output
+
         log_probs = None
         if sampling_params.get("logprobs", None) is not None:
-            log_probs = final_res.request_output.diffusion_output["all_log_probs"][0].tolist()
+            log_probs_raw = diffusion_output.get("all_log_probs") if isinstance(diffusion_output, dict) else None
+            if log_probs_raw is not None:
+                log_probs = _unwrap_first(log_probs_raw).tolist()
 
-        all_latents = final_res.request_output.diffusion_output["all_latents"][0]
-        all_timesteps = final_res.request_output.diffusion_output["all_timesteps"][0]
-        prompt_embeds = final_res.request_output.diffusion_output["prompt_embeds"][0]
-        prompt_embeds_mask = final_res.request_output.diffusion_output["prompt_embeds_mask"][0]
-        negative_prompt_embeds = final_res.request_output.diffusion_output["negative_prompt_embeds"]
-        negative_prompt_embeds_mask = final_res.request_output.diffusion_output["negative_prompt_embeds_mask"]
+        all_latents = _unwrap_first(
+            diffusion_output.get("all_latents") if isinstance(diffusion_output, dict) else None
+        )
+        if all_latents is None:
+            all_latents = getattr(final_res, "latents", None) or cached_latents
+
+        all_timesteps = _unwrap_first(
+            diffusion_output.get("all_timesteps") if isinstance(diffusion_output, dict) else None
+        )
+        if all_timesteps is None:
+            all_timesteps = _unwrap_first(((cached_metrics or getattr(final_res, "metrics", {}) or {}).get("trajectory_timesteps")))
+
+        prompt_embeds = _unwrap_first(
+            diffusion_output.get("prompt_embeds") if isinstance(diffusion_output, dict) else None
+        )
+        prompt_embeds_mask = _unwrap_first(
+            diffusion_output.get("prompt_embeds_mask") if isinstance(diffusion_output, dict) else None
+        )
+        negative_prompt_embeds = diffusion_output.get("negative_prompt_embeds") if isinstance(diffusion_output, dict) else None
+        negative_prompt_embeds_mask = (
+            diffusion_output.get("negative_prompt_embeds_mask") if isinstance(diffusion_output, dict) else None
+        )
 
         extra_fields = {
             "all_latents": all_latents,

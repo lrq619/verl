@@ -18,8 +18,10 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from pprint import pprint
 from typing import Any, Optional
 
@@ -225,8 +227,25 @@ class RayFlowGRPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self._stage_start_times: dict[str, float] = {}
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _stage_log(self, stage: str, message: str):
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+        print(f"[FlowGRPO][{ts}][{stage}] {message}", flush=True)
+
+    def _stage_start(self, stage: str):
+        self._stage_start_times[stage] = time.monotonic()
+        self._stage_log(stage, "START")
+
+    def _stage_end(self, stage: str, message: str = "END"):
+        start = self._stage_start_times.pop(stage, None)
+        if start is None:
+            self._stage_log(stage, message)
+            return
+        elapsed = time.monotonic() - start
+        self._stage_log(stage, f"{message} elapsed={elapsed:.3f}s")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -614,7 +633,9 @@ class RayFlowGRPOTrainer:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._stage_start("init_workers/create_resource_pool")
         self.resource_pool_manager.create_resource_pool()
+        self._stage_end("init_workers/create_resource_pool")
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
@@ -694,6 +715,7 @@ class RayFlowGRPOTrainer:
                 )
         wg_kwargs["device_name"] = self.device_name
 
+        self._stage_start("init_workers/spawn_worker_groups")
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
                 continue
@@ -705,6 +727,7 @@ class RayFlowGRPOTrainer:
             )
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
+        self._stage_end("init_workers/spawn_worker_groups", message=f"END spawned={list(all_wg.keys())}")
 
         if self.use_critic:
             self.critic_wg = all_wg[str(Role.Critic)]
@@ -731,7 +754,9 @@ class RayFlowGRPOTrainer:
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         self.actor_rollout_wg = all_wg[str(actor_role)]
+        self._stage_start("init_workers/actor_rollout_wg.init_model")
         self.actor_rollout_wg.init_model()
+        self._stage_end("init_workers/actor_rollout_wg.init_model")
 
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
@@ -743,10 +768,12 @@ class RayFlowGRPOTrainer:
         # reward model (colocate or standalone): get resource_pool
         # no reward model: resource_pool = None
         resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
+        self._stage_start("init_workers/RewardLoopManager.__init__")
         self.reward_loop_manager = RewardLoopManager(
             config=self.config,
             rm_resource_pool=resource_pool,
         )
+        self._stage_end("init_workers/RewardLoopManager.__init__")
 
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
@@ -767,21 +794,27 @@ class RayFlowGRPOTrainer:
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        self._stage_start("init_workers/AgentLoopManager.__init__")
         self.async_rollout_manager = AgentLoopManager(
             config=self.config,
             worker_group=self.actor_rollout_wg,
             rollout_resource_pool=actor_rollout_resource_pool,
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
+        self._stage_end("init_workers/AgentLoopManager.__init__")
 
+        self._stage_start("init_workers/CheckpointEngineManager.__init__")
         self.checkpoint_manager = CheckpointEngineManager(
             backend=self.config.actor_rollout_ref.rollout.checkpoint_engine.backend,
             trainer=self.actor_rollout_wg,
             replicas=self.async_rollout_manager.rollout_replicas,
         )
+        self._stage_end("init_workers/CheckpointEngineManager.__init__")
 
         # sleep all replicas to load checkpoint
+        self._stage_start("init_workers/checkpoint_manager.sleep_replicas")
         self.checkpoint_manager.sleep_replicas()
+        self._stage_end("init_workers/checkpoint_manager.sleep_replicas")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1179,8 +1212,16 @@ class RayFlowGRPOTrainer:
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
+        self._stage_start("fit/_load_checkpoint")
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights()
+        self._stage_end("fit/_load_checkpoint")
+        skip_initial_update = self.config.trainer.get("skip_initial_update_weights", False)
+        if skip_initial_update:
+            print("[FlowGRPO] skip initial checkpoint_manager.update_weights (trainer.skip_initial_update_weights=True)")
+        else:
+            self._stage_start("fit/checkpoint_manager.update_weights_before_train")
+            self.checkpoint_manager.update_weights()
+            self._stage_end("fit/checkpoint_manager.update_weights_before_train")
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 

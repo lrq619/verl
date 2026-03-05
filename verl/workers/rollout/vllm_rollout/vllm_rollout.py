@@ -31,6 +31,7 @@ import gc
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Generator, Optional
 
 import ray
@@ -50,6 +51,11 @@ from verl.workers.rollout.vllm_rollout.utils import TensorMetadata, get_device_u
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _rollout_sync_log(stage: str, message: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    print(f"[RolloutSync][{ts}][{stage}] {message}", flush=True)
 
 
 def _check_vllm_version_for_sleep_level():
@@ -165,24 +171,32 @@ class ServerAdapter(BaseRollout):
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
         start_time = time.time()
+        log_prefix = f"ServerAdapter.update_weights/r{self.replica_rank}.n{self.node_rank}.rr{self.rollout_rank}"
+        _rollout_sync_log(log_prefix, f"START use_shm={self.use_shm}")
 
+        _rollout_sync_log(log_prefix, "collective_rpc(update_weights_from_ipc) DISPATCH")
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
             kwargs={**kwargs, "use_shm": self.use_shm},
         )
+        _rollout_sync_log(log_prefix, "collective_rpc(update_weights_from_ipc) DISPATCHED")
 
         # build communication buffer
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
         bucket_size = int(bucket_size_mb) << 20
+        _rollout_sync_log(log_prefix, f"bucket_size={bucket_size_mb}MB ({bucket_size} bytes)")
         s = self.zmq_context.socket(zmq.REQ)
         s.bind(self.zmq_handle)
+        _rollout_sync_log(log_prefix, f"zmq_bind={self.zmq_handle}")
 
         buffer, shm = None, None
         if not self.use_shm:
             buffer = torch.empty(bucket_size, dtype=torch.uint8, device=f"{get_device_name()}:0")
             handle = reduce_tensor(buffer)
+            _rollout_sync_log(log_prefix, "send_ipc_handle START")
             s.send_pyobj(handle)
+            _rollout_sync_log(log_prefix, "send_ipc_handle END")
         else:
             import uuid
             from multiprocessing import shared_memory
@@ -193,13 +207,19 @@ class ServerAdapter(BaseRollout):
             buffer = torch.frombuffer(shm.buf, dtype=torch.uint8)
 
             comm_metadata = {"name": shm_name, "size": bucket_size}
+            _rollout_sync_log(log_prefix, f"send_shm_metadata START name={shm_name} size={bucket_size}")
             s.send_pyobj(comm_metadata)
+            _rollout_sync_log(log_prefix, "send_shm_metadata END")
 
+        _rollout_sync_log(log_prefix, "wait_worker_ack_after_comm_metadata START")
         s.recv()
+        _rollout_sync_log(log_prefix, "wait_worker_ack_after_comm_metadata END")
 
         # send bucket weights
         offset = 0
         bucket_meta: dict[str, TensorMetadata] = {}
+        bucket_idx = 0
+        total_tensors = 0
         # dtype = PrecisionType.to_dtype(self.config.dtype)
         async for name, weight in ensure_async_iterator(weights):
             # model parameters are in fp32 full precision
@@ -212,10 +232,17 @@ class ServerAdapter(BaseRollout):
             # fill the tensor bucket
             if offset + weight.nbytes > bucket_size:
                 get_torch_device().synchronize()
+                _rollout_sync_log(
+                    log_prefix,
+                    f"bucket_send START idx={bucket_idx} tensors={len(bucket_meta)} bytes={offset} is_last=False",
+                )
                 s.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
+                _rollout_sync_log(log_prefix, f"bucket_send WAIT_ACK idx={bucket_idx}")
                 s.recv()
+                _rollout_sync_log(log_prefix, f"bucket_send ACKED idx={bucket_idx}")
                 bucket_meta = {}
                 offset = 0
+                bucket_idx += 1
 
             # TODO: slice embedding layer weight into chunks
             assert offset + weight.nbytes <= bucket_size, (
@@ -230,11 +257,19 @@ class ServerAdapter(BaseRollout):
             }
             buffer[offset : offset + weight.nbytes].copy_(weight.view(-1).view(torch.uint8), non_blocking=True)
             offset += weight.nbytes
+            total_tensors += 1
 
         # send the last bucket
         get_torch_device().synchronize()
+        _rollout_sync_log(
+            log_prefix,
+            f"bucket_send START idx={bucket_idx} tensors={len(bucket_meta)} bytes={offset} is_last=True",
+        )
         s.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
+        _rollout_sync_log(log_prefix, f"bucket_send WAIT_ACK idx={bucket_idx}")
         s.recv()
+        _rollout_sync_log(log_prefix, f"bucket_send ACKED idx={bucket_idx}")
+        _rollout_sync_log(log_prefix, f"all_buckets_sent total_buckets={bucket_idx + 1} total_tensors={total_tensors}")
 
         # clean up
         s.close()
@@ -247,14 +282,19 @@ class ServerAdapter(BaseRollout):
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
         if future is not None:
+            _rollout_sync_log(log_prefix, "wait_collective_rpc_completion START")
             await future
+            _rollout_sync_log(log_prefix, "wait_collective_rpc_completion END")
 
         # reset prefix cache after updating weights
         if self.rollout_rank == 0:
+            _rollout_sync_log(log_prefix, "clear_kv_cache START")
             await self.server_handle.clear_kv_cache.remote()
+            _rollout_sync_log(log_prefix, "clear_kv_cache END")
 
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
+        _rollout_sync_log(log_prefix, f"END elapsed={time.time() - start_time:.3f}s")
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.

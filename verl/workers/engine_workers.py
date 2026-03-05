@@ -14,7 +14,9 @@
 import functools
 import logging
 import os
+import time
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from functools import partial
 from itertools import chain
 
@@ -48,6 +50,11 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _sync_log(stage: str, message: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    print(f"[WorkerSync][{ts}][{stage}] {message}", flush=True)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -633,11 +640,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         2. For async training with disaggregated trainer and rollout, send_weights only by checkpoint engine.
         """
         assert self.checkpoint_engine is not None
+        rank = torch.distributed.get_rank()
+        stage_prefix = f"engine_worker.update_weights/rank={rank}/role={self.role}"
+        t0 = time.monotonic()
+        _sync_log(stage_prefix, f"START backend={self.config.rollout.checkpoint_engine.backend}")
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
+            t_send = time.monotonic()
+            _sync_log(f"{stage_prefix}/send_weights_only", "START")
             per_tensor_param, _ = self.engine.get_per_tensor_param()
             await self.checkpoint_engine.send_weights(per_tensor_param)
+            _sync_log(f"{stage_prefix}/send_weights_only", f"END elapsed={time.monotonic() - t_send:.3f}s")
+            _sync_log(stage_prefix, f"END elapsed={time.monotonic() - t0:.3f}s")
             return
 
         set_expandable_segments(False)
@@ -645,15 +660,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 1. resume weights and update weights
         if self.config.rollout.free_cache_engine:
+            t_resume_weights = time.monotonic()
+            _sync_log(f"{stage_prefix}/rollout.resume(weights)", "START")
             await self.rollout.resume(tags=["weights"])
+            _sync_log(
+                f"{stage_prefix}/rollout.resume(weights)",
+                f"END elapsed={time.monotonic() - t_resume_weights:.3f}s",
+            )
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. get per tensor generator from engine, this will load model to gpu
+        t_get_params = time.monotonic()
+        _sync_log(f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=True)", "START")
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
         )
+        _sync_log(
+            f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=True)",
+            f"END elapsed={time.monotonic() - t_get_params:.3f}s peft_config={'yes' if peft_config is not None else 'no'}",
+        )
 
+        t_rollout_update = time.monotonic()
+        _sync_log(f"{stage_prefix}/rollout.update_weights(base_sync_done=True)", "START")
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
+        _sync_log(
+            f"{stage_prefix}/rollout.update_weights(base_sync_done=True)",
+            f"END elapsed={time.monotonic() - t_rollout_update:.3f}s",
+        )
 
         do_lora_base_sync = False
         if not self.peft_merge and peft_config is not None:
@@ -667,24 +700,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
 
         if do_lora_base_sync:
+            t_get_base = time.monotonic()
+            _sync_log(f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=False)", "START")
             per_tensor_base_params, _ = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
             )
+            _sync_log(
+                f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=False)",
+                f"END elapsed={time.monotonic() - t_get_base:.3f}s",
+            )
+            t_rollout_update_base = time.monotonic()
+            _sync_log(f"{stage_prefix}/rollout.update_weights(base_sync_done=False)", "START")
             await self.rollout.update_weights(per_tensor_base_params, peft_config=peft_config, base_sync_done=False)
+            _sync_log(
+                f"{stage_prefix}/rollout.update_weights(base_sync_done=False)",
+                f"END elapsed={time.monotonic() - t_rollout_update_base:.3f}s",
+            )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
+        t_to_cpu = time.monotonic()
+        _sync_log(f"{stage_prefix}/actor.engine.to(cpu)", "START")
         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
+        _sync_log(f"{stage_prefix}/actor.engine.to(cpu)", f"END elapsed={time.monotonic() - t_to_cpu:.3f}s")
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
+            t_resume_kv = time.monotonic()
+            _sync_log(f"{stage_prefix}/rollout.resume(kv_cache)", "START")
             await self.rollout.resume(tags=["kv_cache"])
+            _sync_log(
+                f"{stage_prefix}/rollout.resume(kv_cache)",
+                f"END elapsed={time.monotonic() - t_resume_kv:.3f}s",
+            )
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        _sync_log(stage_prefix, f"END elapsed={time.monotonic() - t0:.3f}s")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

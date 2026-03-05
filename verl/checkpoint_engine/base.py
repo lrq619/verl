@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import time
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from typing import Any, Generator, TypedDict
 
 import ray
@@ -25,6 +27,11 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.ray_utils import auto_await
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
+
+
+def _sync_log(stage: str, message: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
+    print(f"[CheckpointSync][{ts}][{stage}] {message}", flush=True)
 
 
 class TensorMeta(TypedDict):
@@ -326,17 +333,26 @@ class CheckpointEngineManager:
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
         trainer = self.trainer
+        t0 = time.monotonic()
+        _sync_log(
+            "build_process_group",
+            f"START trainer_world_size={trainer.world_size} rollout_world_size={rollout.world_size}",
+        )
 
         # 1. prepare all workers
+        t_prepare = time.monotonic()
         metadata = ray.get(
             trainer.execute_checkpoint_engine(["prepare"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size)
         )
+        _sync_log("build_process_group/prepare", f"END elapsed={time.monotonic() - t_prepare:.3f}s")
 
         # 2. build communication topology between all workers
+        t_topo = time.monotonic()
         trainer_kwargs, rollout_kwargs = self.backend_cls.build_topology(
             trainer.world_size, rollout.world_size, metadata
         )
+        _sync_log("build_process_group/build_topology", f"END elapsed={time.monotonic() - t_topo:.3f}s")
         for k, v in trainer_kwargs.items():
             assert len(v) == trainer.world_size, f"trainer_kwargs[{k}] must have length of {trainer.world_size}"
         for k, v in rollout_kwargs.items():
@@ -346,9 +362,12 @@ class CheckpointEngineManager:
         rollout_kwargs["method"] = ["init_process_group"] * rollout.world_size
 
         # 3. init process group between all workers
+        t_init_pg = time.monotonic()
         ray.get(
             trainer.execute_checkpoint_engine(**trainer_kwargs) + rollout.execute_checkpoint_engine(**rollout_kwargs)
         )
+        _sync_log("build_process_group/init_process_group", f"END elapsed={time.monotonic() - t_init_pg:.3f}s")
+        _sync_log("build_process_group", f"END elapsed={time.monotonic() - t0:.3f}s")
 
     def add_replicas(self, replicas: list[RolloutReplica]):
         """Add rollout replicas to the manager for elastic scale up, will rebuild process group.
@@ -373,38 +392,71 @@ class CheckpointEngineManager:
         # skip sleep replicas for disaggregated rollout
         if self.backend != "naive":
             return
+        t0 = time.monotonic()
+        _sync_log("sleep_replicas", f"START replicas={len(self.replicas)} backend={self.backend}")
         await asyncio.gather(*[r.sleep() for r in self.replicas])
+        _sync_log("sleep_replicas", f"END elapsed={time.monotonic() - t0:.3f}s")
 
     @auto_await
     async def update_weights(self):
         """Update weights from trainer to rollout replicas."""
+        t0 = time.monotonic()
+        _sync_log("update_weights", f"START backend={self.backend} replicas={len(self.replicas)}")
 
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
+            t_sync = time.monotonic()
+            _sync_log("update_weights/trainer.update_weights", "START")
             ray.get(self.trainer.update_weights())
+            _sync_log("update_weights/trainer.update_weights", f"END elapsed={time.monotonic() - t_sync:.3f}s")
+            _sync_log("update_weights", f"END elapsed={time.monotonic() - t0:.3f}s")
             return
 
         # 1. abort and save all unfinished requests for partial rollout
+        t_abort = time.monotonic()
+        _sync_log("update_weights/abort_all_requests", "START")
         await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
+        _sync_log("update_weights/abort_all_requests", f"END elapsed={time.monotonic() - t_abort:.3f}s")
 
         # 2. create a temporay worker group for all replicas
+        t_rollout = time.monotonic()
         workers = []
         for replica in self.replicas:
             workers.extend(replica.workers)
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
+        _sync_log(
+            "update_weights/create_rollout_worker_group",
+            f"END elapsed={time.monotonic() - t_rollout:.3f}s workers={len(workers)} rollout_world_size={rollout.world_size}",
+        )
 
         # 3. build process group
         self.build_process_group(rollout)
 
         # 4. update weights of all workers
+        t_update = time.monotonic()
+        _sync_log(
+            "update_weights/trainer+rollout.update_weights",
+            f"START trainer_world_size={trainer.world_size} rollout_world_size={rollout.world_size}",
+        )
         ray.get(trainer.update_weights() + rollout.update_weights())
+        _sync_log(
+            "update_weights/trainer+rollout.update_weights",
+            f"END elapsed={time.monotonic() - t_update:.3f}s",
+        )
 
         # 5. finalize all workers
+        t_finalize = time.monotonic()
+        _sync_log("update_weights/finalize_checkpoint_engine", "START")
         ray.get(
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+        _sync_log("update_weights/finalize_checkpoint_engine", f"END elapsed={time.monotonic() - t_finalize:.3f}s")
 
         # 6. resume all unfinished requests for partial rollout
+        t_resume = time.monotonic()
+        _sync_log("update_weights/resume_all_requests", "START")
         await asyncio.gather(*[r.resume_all_requests() for r in self.replicas])
+        _sync_log("update_weights/resume_all_requests", f"END elapsed={time.monotonic() - t_resume:.3f}s")
+        _sync_log("update_weights", f"END elapsed={time.monotonic() - t0:.3f}s")
