@@ -1,0 +1,86 @@
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CUDA_HOME=/usr/local/cuda \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Core OS + build toolchain + useful debugging/network tools.
+# Ali custom-image required commands are included here:
+# python3, curl, wget, sudo, ca-certificates, git, iptables, pip, apt-get
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    ca-certificates \
+    curl \
+    wget \
+    git \
+    git-lfs \
+    sudo \
+    iptables \
+    openssh-client \
+    vim \
+    nano \
+    less \
+    unzip \
+    zip \
+    jq \
+    htop \
+    tmux \
+    pciutils \
+    iputils-ping \
+    net-tools \
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    ninja-build \
+    cmake \
+    pkg-config \
+    ccache \
+    libnuma-dev \
+    libaio-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 3.12 + pip.
+RUN add-apt-repository ppa:deadsnakes/ppa -y && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && \
+    python3.12 /tmp/get-pip.py && \
+    rm -f /tmp/get-pip.py
+
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3.12 /usr/bin/python
+
+# Ensure `pip` command is available in PATH as required by Ali custom-image checks.
+RUN ln -sf /usr/local/bin/pip /usr/bin/pip || true
+
+# Useful Python tooling only (no verl/vllm install here).
+RUN python -m pip install --upgrade pip setuptools wheel uv
+
+# Optional but recommended by Ali custom-image docs:
+# create admin user with uid != 1000 for sudo terminal compatibility.
+ARG ADMIN_USER=admin
+ARG ADMIN_UID=1101
+ARG ADMIN_GID=1101
+RUN groupadd -g ${ADMIN_GID} ${ADMIN_USER} && \
+    useradd -m -u ${ADMIN_UID} -g ${ADMIN_GID} -s /bin/bash ${ADMIN_USER} && \
+    usermod -aG sudo ${ADMIN_USER} && \
+    echo "${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${ADMIN_USER} && \
+    chmod 0440 /etc/sudoers.d/${ADMIN_USER}
+
+WORKDIR /workspace
+
+# Keep container alive by default for dev attach.
+CMD ["bash"]
