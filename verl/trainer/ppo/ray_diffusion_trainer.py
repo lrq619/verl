@@ -1201,7 +1201,7 @@ class RayFlowGRPOTrainer:
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
-
+        # self._stage_start(f"fit")
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1240,7 +1240,9 @@ class RayFlowGRPOTrainer:
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        print(f"Before progress bar")
+        # progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        print(f"After progress bar")
 
         # we start from step 1
         self.global_steps += 1
@@ -1254,14 +1256,21 @@ class RayFlowGRPOTrainer:
             else False
         )
         next_step_profile = False
+        print(
+            f"global_steps={self.global_steps}, len(train_loader)={len(self.train_dataloader)}, "
+            f"current_epoch={current_epoch}, total_epochs={self.config.trainer.total_epochs}, "
+            f"val_only={self.config.trainer.get('val_only', False)}",
+            flush=True,
+        )
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for i, batch_dict in enumerate(self.train_dataloader):
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
 
+                print(f"Start the {i}th batch_dict, with size: {len(batch_dict)}")
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1289,8 +1298,12 @@ class RayFlowGRPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
+                        self._stage_start(f"Start gen of the epoch: {epoch}, batch: {i}")
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        print(f"Finished generation!")
+                        self._stage_end(f"Start gen of the epoch: {epoch}, batch: {i}")
                         self.checkpoint_manager.sleep_replicas()
+                        print(f"replicas sleep!")
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1510,7 +1523,7 @@ class RayFlowGRPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                progress_bar.update(1)
+                # progress_bar.update(1)
                 self.global_steps += 1
 
                 if (
@@ -1525,7 +1538,7 @@ class RayFlowGRPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
+                    # progress_bar.close()
                     return
 
                 # this is experimental and may be changed/removed in the future

@@ -1043,13 +1043,28 @@ class DiffusionAgentLoopWorker:
         extra_fields = {}
         for k, v in output.extra_fields.items():
             if isinstance(v, torch.Tensor):
+                if k in ["prompt_embeds", "negative_prompt_embeds"] and v.dim() == 3 and v.shape[0] == 1:
+                    v = v.squeeze(0)
+                elif k in ["prompt_embeds_mask", "negative_prompt_embeds_mask"] and v.dim() == 2 and v.shape[0] == 1:
+                    v = v.squeeze(0)
+
                 # handle prompt embedding padding
                 if k in ["prompt_embeds", "negative_prompt_embeds"]:
-                    pad_tuple = (0, 0, 0, self.config.actor_rollout_ref.rollout.prompt_length - v.shape[0])
-                    v = F.pad(v, pad_tuple, value=0)
+                    seq_len = v.shape[0]
+                    max_len = self.config.actor_rollout_ref.rollout.prompt_length
+                    if seq_len > max_len:
+                        v = v[:max_len]
+                    else:
+                        pad_tuple = (0, 0, 0, max_len - seq_len)
+                        v = F.pad(v, pad_tuple, value=0)
                 elif k in ["prompt_embeds_mask", "negative_prompt_embeds_mask"]:
-                    pad_tuple = (0, self.config.actor_rollout_ref.rollout.prompt_length - v.shape[0])
-                    v = F.pad(v, pad_tuple, value=0)
+                    seq_len = v.shape[0]
+                    max_len = self.config.actor_rollout_ref.rollout.prompt_length
+                    if seq_len > max_len:
+                        v = v[:max_len]
+                    else:
+                        pad_tuple = (0, max_len - seq_len)
+                        v = F.pad(v, pad_tuple, value=0)
                 extra_fields[k] = v.unsqueeze(0)
             else:
                 extra_fields[k] = v
@@ -1369,6 +1384,7 @@ class AgentLoopManager:
         """
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        print(f"prompts are splitted into {len(chunkes)} chunkes, with the length of {len(chunkes[0])}")
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)

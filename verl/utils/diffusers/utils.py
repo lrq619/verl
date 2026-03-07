@@ -44,7 +44,7 @@ def set_timesteps(scheduler: SchedulerMixin, model_config: DiffusersModelConfig)
     if _is_qwen_image_model(model_config):
         from diffusers.pipelines.qwenimage.pipeline_qwenimage import calculate_shift
 
-        vae_scale_factor = 8
+        vae_scale_factor = getattr(model_config, "vae_scale_factor", 8)
         latent_height, latent_width = (
             model_config.image_height // vae_scale_factor // 2,
             model_config.image_width // vae_scale_factor // 2,

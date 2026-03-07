@@ -283,6 +283,7 @@ class DiffusersModelConfig(BaseConfig):
     # sample related
     image_height: int = 512
     image_width: int = 512
+    vae_scale_factor: int = 8
     num_inference_steps: int = 10
     noise_level: float = 0.7
     guidance_scale: float = 4.5

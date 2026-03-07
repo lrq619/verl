@@ -45,6 +45,25 @@ class FlowMatchSDEDiscreteSchedulerOutput(BaseOutput):
 
 
 class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
+    def index_for_timestep(self, timestep, schedule_timesteps=None):
+        if schedule_timesteps is None:
+            schedule_timesteps = self.timesteps
+
+        if isinstance(timestep, torch.Tensor):
+            timestep = timestep.detach().to(device=schedule_timesteps.device, dtype=schedule_timesteps.dtype).reshape(-1)[0]
+        else:
+            timestep = torch.tensor(timestep, device=schedule_timesteps.device, dtype=schedule_timesteps.dtype)
+
+        indices = (schedule_timesteps == timestep).nonzero()
+        if len(indices) == 0:
+            deltas = torch.abs(schedule_timesteps - timestep)
+            nearest_index = int(torch.argmin(deltas).item())
+            return nearest_index
+
+        # Match diffusers behavior when the schedule contains duplicates.
+        pos = 1 if len(indices) > 1 else 0
+        return indices[pos].item()
+
     def step(
         self,
         model_output: torch.FloatTensor,

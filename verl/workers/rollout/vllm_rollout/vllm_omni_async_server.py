@@ -19,6 +19,7 @@ import logging
 import os
 from pprint import pprint
 from typing import Any, Callable, Optional
+import torch
 
 import ray
 import torchvision.transforms as T
@@ -261,6 +262,7 @@ class vLLMOmniHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+        logger.info("vllm_omni gpu_memory_utilization=%s", args.get("gpu_memory_utilization"))
 
         if self.config.prometheus.enable:
             if self.config.prometheus.served_model_name:
@@ -369,6 +371,7 @@ class vLLMOmniHttpServer:
         # TODO (mike): read custom_pipeline from CLI
         custom_pipeline = self.config.engine_kwargs.get("vllm_omni", {}).get("custom_pipeline", None)
         if custom_pipeline is not None:
+            kwargs["custom_pipeline"] = custom_pipeline
             kwargs["enable_dummy_pipeline"] = True
             kwargs["custom_pipeline_args"] = {"pipeline_class": custom_pipeline}
 
@@ -446,28 +449,10 @@ class vLLMOmniHttpServer:
             output_modalities=["image"],
         )
 
-        # Get final response. Some vLLM-Omni versions only expose diffusion tensors
-        # on intermediate outputs, so we cache the last non-empty payload seen.
+        # Get final response
         final_res: Optional[OmniRequestOutput] = None
-        cached_diffusion_output = None
-        cached_multimodal_output = None
-        cached_metrics = None
-        cached_latents = None
         async for output in generator:
             final_res = output
-            req_out = getattr(output, "request_output", None)
-            maybe_diff = getattr(req_out, "diffusion_output", None) if req_out is not None else None
-            if isinstance(maybe_diff, dict) and len(maybe_diff) > 0:
-                cached_diffusion_output = maybe_diff
-            maybe_mm = getattr(output, "multimodal_output", None)
-            if isinstance(maybe_mm, dict) and len(maybe_mm) > 0:
-                cached_multimodal_output = maybe_mm
-            maybe_metrics = getattr(output, "metrics", None)
-            if isinstance(maybe_metrics, dict) and len(maybe_metrics) > 0:
-                cached_metrics = maybe_metrics
-            maybe_latents = getattr(output, "latents", None)
-            if maybe_latents is not None:
-                cached_latents = maybe_latents
         assert final_res is not None
 
         image = (self._to_tensor(final_res.images[0]) / 255.0).tolist()
@@ -476,30 +461,26 @@ class vLLMOmniHttpServer:
         # Old versions expose diffusion tensors at final_res.request_output.diffusion_output.
         # New versions expose top-level fields (latents/metrics/multimodal_output).
         request_output = getattr(final_res, "request_output", None)
+        # logger.info(f"[vLLMOmni] request_output: {request_output}")
         diffusion_output = getattr(request_output, "diffusion_output", None) if request_output is not None else None
-        multimodal_output = getattr(final_res, "multimodal_output", {}) or {}
+        multimodal_output = getattr(request_output, "multimodal_output", {}) or {}
 
         def _unwrap_first(x):
             if x is None:
                 return None
             if isinstance(x, (list, tuple)) and len(x) > 0:
                 return x[0]
+            if isinstance(x, torch.Tensor) and x.dim() > 0 and x.shape[0] == 1:
+                return x[0]
             return x
 
         if diffusion_output is None:
-            metrics = (getattr(final_res, "metrics", {}) or {})
-            if (not multimodal_output) and cached_multimodal_output:
-                multimodal_output = cached_multimodal_output
-            if (not metrics) and cached_metrics:
-                metrics = cached_metrics
             logger.info(
-                "[vLLMOmni] diffusion_output missing on request_output; using OmniRequestOutput fallback "
-                "keys=%s metrics=%s cached_diffusion=%s",
+                "[vLLMOmni] diffusion_output missing on request_output; using multi modal output fallback "
+                "keys=%s",
                 sorted(multimodal_output.keys()),
-                sorted(metrics.keys()),
-                cached_diffusion_output is not None,
             )
-            diffusion_output = cached_diffusion_output or multimodal_output
+            diffusion_output = multimodal_output
 
         log_probs = None
         if sampling_params.get("logprobs", None) is not None:
@@ -510,24 +491,21 @@ class vLLMOmniHttpServer:
         all_latents = _unwrap_first(
             diffusion_output.get("all_latents") if isinstance(diffusion_output, dict) else None
         )
-        if all_latents is None:
-            all_latents = getattr(final_res, "latents", None) or cached_latents
 
         all_timesteps = _unwrap_first(
             diffusion_output.get("all_timesteps") if isinstance(diffusion_output, dict) else None
         )
-        if all_timesteps is None:
-            all_timesteps = _unwrap_first(((cached_metrics or getattr(final_res, "metrics", {}) or {}).get("trajectory_timesteps")))
-
         prompt_embeds = _unwrap_first(
             diffusion_output.get("prompt_embeds") if isinstance(diffusion_output, dict) else None
         )
         prompt_embeds_mask = _unwrap_first(
             diffusion_output.get("prompt_embeds_mask") if isinstance(diffusion_output, dict) else None
         )
-        negative_prompt_embeds = diffusion_output.get("negative_prompt_embeds") if isinstance(diffusion_output, dict) else None
+        negative_prompt_embeds = _unwrap_first(
+            diffusion_output.get("negative_prompt_embeds") if isinstance(diffusion_output, dict) else None
+        )
         negative_prompt_embeds_mask = (
-            diffusion_output.get("negative_prompt_embeds_mask") if isinstance(diffusion_output, dict) else None
+            _unwrap_first(diffusion_output.get("negative_prompt_embeds_mask")) if isinstance(diffusion_output, dict) else None
         )
 
         extra_fields = {
@@ -535,10 +513,8 @@ class vLLMOmniHttpServer:
             "all_timesteps": all_timesteps,
             "prompt_embeds": prompt_embeds,
             "prompt_embeds_mask": prompt_embeds_mask,
-            "negative_prompt_embeds": negative_prompt_embeds[0] if negative_prompt_embeds is not None else None,
-            "negative_prompt_embeds_mask": negative_prompt_embeds_mask[0]
-            if negative_prompt_embeds_mask is not None
-            else None,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
         }
 
         # Determine stop reason from finish_reason
@@ -557,13 +533,15 @@ class vLLMOmniHttpServer:
         if hasattr(final_res.request_output, "num_preempted"):
             num_preempted = final_res.request_output.num_preempted
 
-        return ImageOutput(
+        image_output = ImageOutput(
             image=image,
             log_probs=log_probs,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,
         )
+        # logger.info(f"img output: log_probs: {image_output.log_probs}, extra_fields: {image_output.extra_fields}")
+        return image_output
 
     async def wake_up(self):
         if self.node_rank != 0:
@@ -584,9 +562,9 @@ class vLLMOmniHttpServer:
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            await self.engine.sleep(level=1)
+            await self.engine.sleep(level=2)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=1)
+            await self.engine.sleep(level=2)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
@@ -607,7 +585,8 @@ class vLLMOmniHttpServer:
             await self.engine.stop_profile()
 
     async def clear_kv_cache(self):
-        pass
+        if self.node_rank == 0:
+            await self.engine.reset_prefix_cache()
 
     async def wait_for_requests_to_drain(self):
         # TODO (mike): to be implemented
