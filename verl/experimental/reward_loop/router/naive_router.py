@@ -163,8 +163,24 @@ class NaiveRouter:
             attempt_start = time.monotonic()
             try:
                 async with self.client.request(request.method, target_url, data=body, headers=headers) as response:
-                    response.raise_for_status()
                     output = await _read_async_response(response)
+                    if response.status >= 400:
+                        body_preview = str(output)[:512].replace("\n", "\\n")
+                        content_type = response.headers.get("Content-Type", "")
+                        logger.error(
+                            "HTTP error for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s "
+                            "status=%s content_type=%s body_preview=%s",
+                            endpoint,
+                            attempt_idx,
+                            self.max_attempts,
+                            worker_url,
+                            target_url,
+                            request_id,
+                            response.status,
+                            content_type,
+                            body_preview,
+                        )
+                        response.raise_for_status()
                     self._release_worker(worker_url)
                     if self.verbose:
                         logger.debug(
@@ -207,7 +223,8 @@ class NaiveRouter:
                 )
             except aiohttp.ClientResponseError as e:
                 logger.error(
-                    "HTTP error for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s status=%s message=%s",
+                    "HTTP error exception for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s "
+                    "status=%s message=%s",
                     endpoint,
                     attempt_idx,
                     self.max_attempts,

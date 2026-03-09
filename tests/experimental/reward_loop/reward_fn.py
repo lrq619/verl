@@ -7,6 +7,8 @@ import base64
 import json
 import logging
 import os
+import time
+import uuid
 from io import BytesIO
 
 import aiohttp
@@ -43,33 +45,68 @@ async def chat_complete(router_address: str, chat_complete_request: dict):
     timeout = aiohttp.ClientTimeout(total=None)
     session = aiohttp.ClientSession(timeout=timeout)
     try:
+        request_id = chat_complete_request.get("request_id") or uuid.uuid4().hex[:12]
         model_name = chat_complete_request.get("model")
-        msg_count = len(chat_complete_request.get("messages", []))
-        async with session.post(url, json=chat_complete_request) as resp:
+        messages = chat_complete_request.get("messages", [])
+        msg_count = len(messages)
+        image_items = 0
+        text_chars = 0
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, str):
+                text_chars += len(content)
+            elif isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "image_url":
+                        image_items += 1
+                    elif item.get("type") == "text":
+                        text_chars += len(item.get("text", ""))
+        payload_bytes = len(json.dumps(chat_complete_request, ensure_ascii=False).encode("utf-8"))
+        start = time.monotonic()
+        headers = {"x-request-id": request_id}
+        async with session.post(url, json=chat_complete_request, headers=headers) as resp:
             output_text = await resp.text()
+            elapsed_ms = (time.monotonic() - start) * 1000
             content_type = resp.headers.get("Content-Type", "")
+            preview = output_text[:512].replace("\n", "\\n")
             if resp.status >= 400:
-                preview = output_text[:512].replace("\n", "\\n")
                 logger.error(
-                    "chat_complete non-2xx response: status=%s model=%s messages=%d url=%s content_type=%s "
-                    "body_preview=%s",
+                    "chat_complete non-2xx response: request_id=%s status=%s model=%s messages=%d "
+                    "image_items=%d text_chars=%d payload_bytes=%d elapsed_ms=%.1f "
+                    "url=%s content_type=%s body_preview=%s",
+                    request_id,
                     resp.status,
                     model_name,
                     msg_count,
+                    image_items,
+                    text_chars,
+                    payload_bytes,
+                    elapsed_ms,
                     url,
                     content_type,
                     preview,
                 )
+                raise RuntimeError(
+                    f"chat_complete non-2xx response: request_id={request_id}, status={resp.status}, "
+                    f"url={url}, content_type={content_type}, body_preview={preview}"
+                )
             try:
                 output = json.loads(output_text)
             except json.JSONDecodeError:
-                preview = output_text[:512].replace("\n", "\\n")
                 logger.error(
-                    "chat_complete JSON decode failed: status=%s model=%s messages=%d url=%s content_type=%s "
-                    "body_preview=%s",
+                    "chat_complete JSON decode failed: request_id=%s status=%s model=%s messages=%d "
+                    "image_items=%d text_chars=%d payload_bytes=%d elapsed_ms=%.1f "
+                    "url=%s content_type=%s body_preview=%s",
+                    request_id,
                     resp.status,
                     model_name,
                     msg_count,
+                    image_items,
+                    text_chars,
+                    payload_bytes,
+                    elapsed_ms,
                     url,
                     content_type,
                     preview,
@@ -78,7 +115,8 @@ async def chat_complete(router_address: str, chat_complete_request: dict):
             return ChatCompletion(**output)
     except Exception as e:
         logger.error(
-            "chat_complete request failed: url=%s model=%s error=%r",
+            "chat_complete request failed: request_id=%s url=%s model=%s error=%r",
+            locals().get("request_id", "n/a"),
             url,
             chat_complete_request.get("model"),
             e,
