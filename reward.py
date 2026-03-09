@@ -1,227 +1,221 @@
 #!/usr/bin/env python3
-"""Launch verl reward model stack once and probe endpoints.
+"""Simulate reward-model vLLM launch path used by verl.
 
-This script uses the same startup path as training:
-`RewardModelManager -> rollout replicas -> naive_router`.
+This reproduces how verl builds vLLM CLI args for reward-model rollout
+(`vLLMHttpServer.launch_server`), prints the exact arg list, validates it with
+the same vLLM parser, and can optionally run real `serve`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
+import pprint
+import shlex
 import sys
-import time
-import urllib.error
-import urllib.request
-from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+def _parse_json_dict(raw: str, name: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON for {name}: {e}") from e
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object, got: {type(value).__name__}")
+    return value
+
+
+def build_cli_args_from_config(config: dict[str, Any]) -> list[str]:
+    """Convert a config dictionary to vLLM CLI args."""
+    cli_args: list[str] = []
+    for key, value in config.items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            if value:
+                cli_args.append(f"--{key}")
+            continue
+        if isinstance(value, list):
+            if not value:
+                continue
+            cli_args.append(f"--{key}")
+            cli_args.extend([str(item) for item in value])
+            continue
+        cli_args.append(f"--{key}")
+        cli_args.append(json.dumps(value) if isinstance(value, dict) else str(value))
+    return cli_args
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Simulate verl RewardModelManager startup (real RM + router launch)."
+        description="Simulate verl reward-model vLLM launch args, validate, and optionally serve."
     )
-    parser.add_argument("--model-path", required=True, help="Reward model path used by reward.reward_model.model_path")
-    parser.add_argument("--rollout-name", default="vllm", choices=["vllm", "sglang", "vllm_omni", "trtllm"])
-    parser.add_argument("--tp", type=int, default=1, help="reward.reward_model.rollout.tensor_model_parallel_size")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
-    parser.add_argument("--n-gpus-per-node", type=int, default=None)
-    parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--model", required=True, help="Reward model path/id.")
+
     parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument("--max-model-len", type=int, default=None)
+    parser.add_argument("--load-format", default="auto")
+    parser.add_argument("--max-model-len", type=int, default=128000)
     parser.add_argument("--max-num-seqs", type=int, default=1024)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
-    parser.add_argument("--load-format", default="auto")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.25)
+    parser.add_argument("--tensor-parallel-size", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--scheduling-policy", default="fcfs")
+    parser.add_argument("--logprobs-mode", default="processed_logprobs")
+
+    parser.add_argument("--enable-chunked-prefill", action="store_true", default=True)
+    parser.add_argument("--disable-enable-chunked-prefill", action="store_true")
+    parser.add_argument("--enable-prefix-caching", action="store_true", default=True)
+    parser.add_argument("--disable-enable-prefix-caching", action="store_true")
+    parser.add_argument("--enable-sleep-mode", action="store_true", default=True)
+    parser.add_argument("--disable-enable-sleep-mode", action="store_true")
+    parser.add_argument("--enforce-eager", action="store_true", default=True)
+    parser.add_argument("--disable-enforce-eager", action="store_true")
+    parser.add_argument("--disable-log-stats", action="store_true", default=True)
+    parser.add_argument("--enable-log-stats", action="store_true")
+    parser.add_argument("--trust-remote-code", action="store_true", default=False)
+
     parser.add_argument(
-        "--probe-kind",
-        default="health",
-        choices=["health", "classify", "chat", "none"],
-        help="Endpoint probe after launch. Use chat for GenRM-style OpenAI probing.",
+        "--override-generation-config-json",
+        default='{"temperature":1.0,"top_k":-1,"top_p":1.0,"repetition_penalty":1.0,"max_new_tokens":2048}',
+        help="JSON object passed as --override_generation_config.",
     )
-    parser.add_argument("--probe-timeout", type=float, default=20.0)
-    parser.add_argument("--chat-max-tokens", type=int, default=8)
     parser.add_argument(
-        "--hold-seconds",
-        type=int,
-        default=30,
-        help="Keep servers alive for this many seconds. Set 0 to exit immediately, -1 to wait forever.",
+        "--hf-overrides-json",
+        default="{}",
+        help="JSON object passed as --hf_overrides.",
     )
-    parser.add_argument("--ray-address", default=None, help="Optional Ray cluster address. Default starts local Ray.")
+    parser.add_argument(
+        "--compilation-config-json",
+        default='{"cudagraph_mode":"FULL_AND_PIECEWISE"}',
+        help="JSON object passed as --compilation_config.",
+    )
+    parser.add_argument(
+        "--engine-kwargs-json",
+        default="{}",
+        help="Extra vLLM CLI args as JSON object (merged into args last).",
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["print", "validate", "serve"],
+        default="validate",
+        help="print: only print args; validate: parse/validate; serve: actually start vLLM serve.",
+    )
     return parser.parse_args()
 
 
-def infer_visible_gpus() -> int | None:
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not cuda_visible:
-        return None
-    entries = [x.strip() for x in cuda_visible.split(",") if x.strip()]
-    return len(entries) if entries else None
+def _resolve_bool_switches(args: argparse.Namespace) -> dict[str, bool]:
+    enable_chunked_prefill = args.enable_chunked_prefill and not args.disable_enable_chunked_prefill
+    enable_prefix_caching = args.enable_prefix_caching and not args.disable_enable_prefix_caching
+    enable_sleep_mode = args.enable_sleep_mode and not args.disable_enable_sleep_mode
+    enforce_eager = args.enforce_eager and not args.disable_enforce_eager
+
+    # default True unless explicitly enabled log stats
+    disable_log_stats = args.disable_log_stats and not args.enable_log_stats
+
+    return {
+        "enable_chunked_prefill": enable_chunked_prefill,
+        "enable_prefix_caching": enable_prefix_caching,
+        "enable_sleep_mode": enable_sleep_mode,
+        "enforce_eager": enforce_eager,
+        "disable_log_stats": disable_log_stats,
+    }
 
 
-def build_config(args: argparse.Namespace):
-    from hydra import compose, initialize_config_dir
+def build_reward_like_cli_args(args: argparse.Namespace) -> list[str]:
+    override_generation_config = _parse_json_dict(
+        args.override_generation_config_json, "--override-generation-config-json"
+    )
+    hf_overrides = _parse_json_dict(args.hf_overrides_json, "--hf-overrides-json")
+    compilation_config = _parse_json_dict(args.compilation_config_json, "--compilation-config-json")
+    engine_kwargs = _parse_json_dict(args.engine_kwargs_json, "--engine-kwargs-json")
+    bools = _resolve_bool_switches(args)
 
-    with initialize_config_dir(config_dir=os.path.abspath(REPO_ROOT / "verl/trainer/config")):
-        config = compose(config_name="ppo_trainer")
+    config: dict[str, Any] = {
+        "dtype": args.dtype,
+        "load_format": args.load_format,
+        "distributed_executor_backend": "mp",
+        "worker_extension_cls": "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "enable_chunked_prefill": bools["enable_chunked_prefill"],
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "enable_prefix_caching": bools["enable_prefix_caching"],
+        "enable_sleep_mode": bools["enable_sleep_mode"],
+        "logprobs_mode": args.logprobs_mode,
+        "enforce_eager": bools["enforce_eager"],
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "disable_log_stats": bools["disable_log_stats"],
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "seed": args.seed,
+        "override_generation_config": override_generation_config,
+        "hf_overrides": hf_overrides,
+        "scheduling_policy": args.scheduling_policy,
+        "compilation_config": compilation_config,
+        "trust_remote_code": args.trust_remote_code,
+    }
 
-    inferred_gpus = infer_visible_gpus()
-    n_gpus_per_node = args.n_gpus_per_node if args.n_gpus_per_node is not None else inferred_gpus or 8
-
-    config.reward.reward_model.enable = True
-    config.reward.reward_model.enable_resource_pool = False
-    config.reward.reward_model.model_path = args.model_path
-    config.reward.reward_model.n_gpus_per_node = n_gpus_per_node
-    config.reward.reward_model.nnodes = args.nnodes
-    config.reward.reward_model.rollout.name = args.rollout_name
-    config.reward.reward_model.rollout.dtype = args.dtype
-    config.reward.reward_model.rollout.gpu_memory_utilization = args.gpu_memory_utilization
-    config.reward.reward_model.rollout.tensor_model_parallel_size = args.tp
-    config.reward.reward_model.rollout.max_num_seqs = args.max_num_seqs
-    config.reward.reward_model.rollout.max_num_batched_tokens = args.max_num_batched_tokens
-    config.reward.reward_model.rollout.load_format = args.load_format
-    config.reward.reward_model.rollout.skip_tokenizer_init = False
-    if args.max_model_len is not None:
-        config.reward.reward_model.rollout.max_model_len = args.max_model_len
-
-    return config, n_gpus_per_node
-
-
-def http_json_request(
-    url: str,
-    method: str = "GET",
-    payload: dict[str, Any] | None = None,
-    timeout: float = 20.0,
-) -> tuple[int, Any]:
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-        try:
-            parsed = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            parsed = body
-        return resp.status, parsed
+    # Keep the same behavior as verl: user-provided engine kwargs override defaults.
+    config.update(engine_kwargs)
+    return ["serve", args.model] + build_cli_args_from_config(config)
 
 
-def probe_one(
-    base_url: str,
-    probe_kind: str,
-    model_path: str,
-    timeout: float,
-    chat_max_tokens: int,
-) -> None:
-    if probe_kind == "none":
-        return
-    if probe_kind == "health":
-        endpoint = "/health"
-        method = "GET"
-        payload = None
-    elif probe_kind == "classify":
-        endpoint = "/classify"
-        method = "POST"
-        payload = {
-            "model": model_path,
-            "input": "hello",
-            "use_activation": False,
-        }
-    else:
-        endpoint = "/v1/chat/completions"
-        method = "POST"
-        payload = {
-            "model": model_path,
-            "messages": [{"role": "user", "content": "Say ok"}],
-            "max_tokens": chat_max_tokens,
-            "temperature": 0.0,
-        }
+def parse_and_validate_with_vllm(cli_args: list[str]) -> tuple[argparse.Namespace, dict[str, Any]]:
+    import vllm.entrypoints.cli.serve
 
-    url = f"{base_url.rstrip('/')}{endpoint}"
-    status, body = http_json_request(url=url, method=method, payload=payload, timeout=timeout)
-    print(f"[probe:{probe_kind}] {url} -> HTTP {status}")
-    if isinstance(body, dict):
-        keys = sorted(body.keys())
-        print(f"[probe:{probe_kind}] response keys: {keys}")
-    else:
-        preview = str(body)
-        if len(preview) > 300:
-            preview = preview[:300] + "...(truncated)"
-        print(f"[probe:{probe_kind}] response: {preview}")
+    try:
+        from vllm.utils.argparse_utils import FlexibleArgumentParser
+    except Exception:
+        from vllm.utils import FlexibleArgumentParser
+
+    cmd_modules = [vllm.entrypoints.cli.serve]
+    parser = FlexibleArgumentParser(description="vLLM CLI")
+    subparsers = parser.add_subparsers(required=False, dest="subparser")
+    cmds: dict[str, Any] = {}
+    for module in cmd_modules:
+        new_cmds = module.cmd_init()
+        for cmd in new_cmds:
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+
+    ns = parser.parse_args(args=cli_args)
+    if hasattr(ns, "model_tag"):
+        ns.model = ns.model_tag
+    if ns.subparser in cmds:
+        cmds[ns.subparser].validate(ns)
+    return ns, cmds
+
+
+def run_serve(ns: argparse.Namespace) -> None:
+    if not hasattr(ns, "dispatch_function") or ns.dispatch_function is None:
+        raise RuntimeError("No dispatch_function on parsed namespace; cannot run serve.")
+    ns.dispatch_function(ns)
 
 
 def main() -> None:
     args = parse_args()
+    cli_args = build_reward_like_cli_args(args)
 
-    import ray
+    print("[reward-like vLLM args list]")
+    pprint.pprint(cli_args, width=120)
+    print("\n[equivalent command]")
+    print("vllm " + shlex.join(cli_args))
 
-    from verl.experimental.reward_loop.reward_model import RewardModelManager
+    if args.mode == "print":
+        return
 
-    if args.tp <= 0:
-        raise ValueError("--tp must be > 0")
+    try:
+        ns, _ = parse_and_validate_with_vllm(cli_args)
+    except SystemExit as e:
+        print("\n[PARSE ERROR] vLLM parser rejected args. This is what verl would hit too.", file=sys.stderr)
+        raise e
 
-    if not ray.is_initialized():
-        ray.init(address=args.ray_address)
-
-    config, n_gpus_per_node = build_config(args)
-    world_size = n_gpus_per_node * args.nnodes
-    expected_replicas = world_size // args.tp
-    if world_size % args.tp != 0:
-        print(
-            f"[warn] world_size={world_size} is not divisible by tp={args.tp}; "
-            "RewardModelManager computes replicas using floor division."
-        )
-
-    print("[launch] RewardModelManager starting")
-    print(f"[launch] model_path={args.model_path}")
-    print(f"[launch] rollout={args.rollout_name} tp={args.tp} world_size={world_size}")
-    print(f"[launch] expected_replicas={expected_replicas} (world_size // tp)")
-
-    manager = RewardModelManager(config.reward.reward_model)
-
-    worker_urls = [f"http://{addr}" for addr in manager.server_addresses]
-    router_url = f"http://{manager.get_router_address()}"
-    print(f"[launch] actual_replicas={len(worker_urls)}")
-    for idx, url in enumerate(worker_urls):
-        print(f"[worker {idx}] {url}")
-    print(f"[router] {router_url}")
-
-    if args.probe_kind != "none":
-        print(f"[probe] kind={args.probe_kind}")
-        for idx, url in enumerate(worker_urls):
-            try:
-                probe_one(url, args.probe_kind, args.model_path, args.probe_timeout, args.chat_max_tokens)
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", errors="replace")
-                print(f"[probe:{args.probe_kind}] worker[{idx}] HTTPError {e.code}: {body}")
-            except Exception as e:  # noqa: BLE001
-                print(f"[probe:{args.probe_kind}] worker[{idx}] failed: {type(e).__name__}: {e}")
-
-        try:
-            probe_one(router_url, args.probe_kind, args.model_path, args.probe_timeout, args.chat_max_tokens)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            print(f"[probe:{args.probe_kind}] router HTTPError {e.code}: {body}")
-        except Exception as e:  # noqa: BLE001
-            print(f"[probe:{args.probe_kind}] router failed: {type(e).__name__}: {e}")
-
-    if args.hold_seconds == -1:
-        print("[hold] waiting forever; Ctrl+C to exit")
-        while True:
-            time.sleep(3600)
-    elif args.hold_seconds > 0:
-        print(f"[hold] sleeping for {args.hold_seconds}s")
-        time.sleep(args.hold_seconds)
-
-    print("[exit] shutting down Ray")
-    ray.shutdown()
+    print("\n[OK] vLLM parser accepted args.")
+    if args.mode == "serve":
+        print("[RUN] starting vLLM serve...")
+        run_serve(ns)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ class vLLMHttpServer:
         gpus_per_node: int,
         nnodes: int,
         cuda_visible_devices: str,
+        role_tag: str = "rollout",
     ):
         """
         Args:
@@ -129,6 +130,7 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self.role_tag = role_tag
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -169,6 +171,16 @@ class vLLMHttpServer:
             f"master_address: {self._master_address}, master_port: {self._master_port}, "
             f"data_parallel_rpc_port: {self._dp_rpc_port}, data_parallel_master_port: {self._dp_master_port}"
         )
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][init] server actor created: replica_rank=%d node_rank=%d "
+                "host=%s visible_devices=%s model=%s",
+                self.replica_rank,
+                self.node_rank,
+                self._server_address,
+                cuda_visible_devices,
+                self.model_config.local_path,
+            )
 
     def get_master_address(self):
         """Get master address and port for data parallel.
@@ -197,6 +209,16 @@ class vLLMHttpServer:
         )
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][launch_server] begin: replica_rank=%d node_rank=%d "
+                "master_address=%s master_port=%s dp_rpc_port=%s",
+                self.replica_rank,
+                self.node_rank,
+                master_address,
+                master_port,
+                dp_rpc_port,
+            )
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -424,13 +446,41 @@ class vLLMHttpServer:
         # 3. launch server
         if self.node_rank == 0:
             self._master_sock.close()
+            if self.role_tag == "reward_model":
+                logger.warning(
+                    "[RM_VLLM_STARTUP][launch_server] node_rank=0 entering run_server: "
+                    "replica_rank=%d node_rank=%d",
+                    self.replica_rank,
+                    self.node_rank,
+                )
             await self.run_server(server_args)
+            if self.role_tag == "reward_model":
+                logger.warning(
+                    "[RM_VLLM_STARTUP][launch_server] node_rank=0 run_server returned: "
+                    "replica_rank=%d node_rank=%d port=%s",
+                    self.replica_rank,
+                    self.node_rank,
+                    self._server_port,
+                )
         else:
             # TODO: avoid connect before master_sock close
             await asyncio.sleep(3)
+            if self.role_tag == "reward_model":
+                logger.warning(
+                    "[RM_VLLM_STARTUP][launch_server] node_rank=%d entering run_headless: replica_rank=%d",
+                    self.node_rank,
+                    self.replica_rank,
+                )
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][run_server] begin: replica_rank=%d node_rank=%d model=%s",
+                self.replica_rank,
+                self.node_rank,
+                self.model_config.local_path,
+            )
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -468,12 +518,33 @@ class vLLMHttpServer:
             await init_app_state(engine_client, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][run_server] engine initialized: replica_rank=%d node_rank=%d",
+                self.replica_rank,
+                self.node_rank,
+            )
 
         self.engine = engine_client
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][run_server] http server ready: replica_rank=%d node_rank=%d "
+                "address=%s:%s",
+                self.replica_rank,
+                self.node_rank,
+                self._server_address,
+                self._server_port,
+            )
 
     async def run_headless(self, args: argparse.Namespace):
         """Run headless server in a separate thread."""
+        if self.role_tag == "reward_model":
+            logger.warning(
+                "[RM_VLLM_STARTUP][run_headless] begin: replica_rank=%d node_rank=%d",
+                self.replica_rank,
+                self.node_rank,
+            )
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
@@ -848,10 +919,20 @@ class vLLMReplica(RolloutReplica):
                 gpus_per_node=gpus_per_replica_node,
                 nnodes=nnodes,
                 cuda_visible_devices=node_cuda_visible_devices,
+                role_tag="reward_model" if self.is_reward_model else "rollout",
             )
             self.servers.append(server)
 
         # launch http server in each node
+        if self.is_reward_model:
+            logger.warning(
+                "[RM_VLLM_STARTUP][replica] before launch_server.remote: replica_rank=%d nnodes=%d "
+                "tp=%d world_size=%d",
+                self.replica_rank,
+                nnodes,
+                self.config.tensor_model_parallel_size,
+                self.world_size,
+            )
         master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
         await asyncio.gather(
             *[
@@ -861,6 +942,11 @@ class vLLMReplica(RolloutReplica):
                 for server in self.servers
             ]
         )
+        if self.is_reward_model:
+            logger.warning(
+                "[RM_VLLM_STARTUP][replica] after launch_server.remote: replica_rank=%d",
+                self.replica_rank,
+            )
 
         # get http server address from first server
         server_address, server_port = await self.servers[0].get_server_address.remote()
@@ -870,6 +956,12 @@ class vLLMReplica(RolloutReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
+        if self.is_reward_model:
+            logger.warning(
+                "[RM_VLLM_STARTUP][replica] reward server address resolved: replica_rank=%d address=%s",
+                self.replica_rank,
+                self._server_address,
+            )
 
     async def sleep(self):
         """Sleep each rollout server."""
