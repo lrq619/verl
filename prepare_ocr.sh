@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # 0) Paths
-RAW_DIR="/root/dataset/ocr"
-OUT_DIR="/root/data/ocr"
+RAW_DIR="/workspace/data/ocr"
+OUT_DIR="/workspace/data/ocr"
 
 # 1) Install tools
 # uv pip install -U "datasets>=2.20" "pyarrow>=19" pandas

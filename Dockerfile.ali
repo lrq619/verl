@@ -83,8 +83,8 @@ RUN groupadd -g ${ADMIN_GID} ${ADMIN_USER} && \
 WORKDIR /workspace
 
 # Keep container alive by default for dev attach.
-COPY ./data /root/data/ocr
-RUN chmod -R a+rX /root/data
+COPY ./data /workspace/data/ocr
+RUN chmod -R a+rX /workspace/data
 
 # 把本地 env 拷进镜像（build context 里要有 ./env）
 COPY ./env /opt/env
@@ -94,5 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends acl \
  && setfacl -R -m u::rwx,g::rwx,o::rwx /opt/env \
  && find /opt/env -type d -exec setfacl -d -m u::rwx,g::rwx,o::rwx {} \; \
  && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /workspace/verl && ln -sfn /opt/env /workspace/verl/env
 
 CMD ["bash"]
