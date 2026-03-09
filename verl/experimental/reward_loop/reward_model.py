@@ -55,6 +55,16 @@ class RewardModelManager:
             else self.config.n_gpus_per_node * self.config.nnodes  # standalone mode
         )
         num_replicas = world_size // rollout_world_size
+        logger.info(
+            "Initializing reward model servers: model_path=%s rollout_name=%s world_size=%d tp=%d num_replicas=%d "
+            "resource_pool=%s",
+            self.config.model_path,
+            self.config.rollout.name,
+            world_size,
+            rollout_world_size,
+            num_replicas,
+            self.resource_pool is not None,
+        )
 
         rollout_replica_class = get_rollout_replica_class(self.config.rollout.name)
         rollout_config = self.config.rollout
@@ -83,9 +93,11 @@ class RewardModelManager:
             self._run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        logger.info("Reward model server addresses: %s", self.server_addresses)
 
     def _initialize_router(self):
         worker_urls = [f"http://{server_address}" for server_address in self.server_addresses]
+        logger.info("Launching reward router with worker URLs: %s", worker_urls)
 
         # TODO (dyy): sglang router is not ready yet.
         # if self.config.rollout.name == "sglang":
@@ -96,6 +108,7 @@ class RewardModelManager:
         from .router.naive_router import launch_router_process
 
         self.router_address, _ = launch_router_process(worker_urls=worker_urls)
+        logger.info("Reward router launched at %s", self.router_address)
 
     def get_router_address(self):
         return self.router_address

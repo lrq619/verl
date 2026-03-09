@@ -5,6 +5,7 @@
 
 import base64
 import json
+import logging
 import os
 from io import BytesIO
 
@@ -14,6 +15,9 @@ import torch
 from openai.types.chat import ChatCompletion
 from PIL import Image
 from transformers import PreTrainedTokenizer
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 GRM_PROMPT_TEMPLATE = """
 You are given a problem and a proposed solution.
@@ -39,10 +43,47 @@ async def chat_complete(router_address: str, chat_complete_request: dict):
     timeout = aiohttp.ClientTimeout(total=None)
     session = aiohttp.ClientSession(timeout=timeout)
     try:
+        model_name = chat_complete_request.get("model")
+        msg_count = len(chat_complete_request.get("messages", []))
         async with session.post(url, json=chat_complete_request) as resp:
-            output = await resp.text()
-            output = json.loads(output)
+            output_text = await resp.text()
+            content_type = resp.headers.get("Content-Type", "")
+            if resp.status >= 400:
+                preview = output_text[:512].replace("\n", "\\n")
+                logger.error(
+                    "chat_complete non-2xx response: status=%s model=%s messages=%d url=%s content_type=%s "
+                    "body_preview=%s",
+                    resp.status,
+                    model_name,
+                    msg_count,
+                    url,
+                    content_type,
+                    preview,
+                )
+            try:
+                output = json.loads(output_text)
+            except json.JSONDecodeError:
+                preview = output_text[:512].replace("\n", "\\n")
+                logger.error(
+                    "chat_complete JSON decode failed: status=%s model=%s messages=%d url=%s content_type=%s "
+                    "body_preview=%s",
+                    resp.status,
+                    model_name,
+                    msg_count,
+                    url,
+                    content_type,
+                    preview,
+                )
+                raise
             return ChatCompletion(**output)
+    except Exception as e:
+        logger.error(
+            "chat_complete request failed: url=%s model=%s error=%r",
+            url,
+            chat_complete_request.get("model"),
+            e,
+        )
+        raise
     finally:
         await session.close()
 
@@ -125,6 +166,7 @@ async def compute_score_ocr(
     chat_complete_request = {"messages": messages, "model": model_name, **sampling_params}
 
     if not reward_router_address or str(reward_router_address).lower() in {"none", "null", ""}:
+        logger.warning("compute_score_ocr missing reward_router_address; returning zero reward")
         return {"score": 0.0, "acc": False, "genrm_response": "reward_router_address_not_provided"}
 
     result = await chat_complete(router_address=reward_router_address, chat_complete_request=chat_complete_request)

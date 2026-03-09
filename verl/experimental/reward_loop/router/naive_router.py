@@ -140,36 +140,114 @@ class NaiveRouter:
         worker_url = self._select_worker()
         target_url = f"{worker_url}/{endpoint}"
 
-        if self.verbose:
-            logger.debug(f"[router] Forwarding request → {target_url}")
-
         # Copy request data
         body = await request.body()
         headers = dict(request.headers)
+        body_size = len(body)
+        request_id = headers.get("x-request-id", headers.get("x-correlation-id", "n/a"))
+
+        if self.verbose:
+            logger.debug(
+                "[router] forwarding request_id=%s method=%s endpoint=%s worker=%s target=%s body_bytes=%d",
+                request_id,
+                request.method,
+                endpoint,
+                worker_url,
+                target_url,
+                body_size,
+            )
 
         for attempt in range(self.max_attempts):
             # Send request to worker
+            attempt_idx = attempt + 1
+            attempt_start = time.monotonic()
             try:
                 async with self.client.request(request.method, target_url, data=body, headers=headers) as response:
                     response.raise_for_status()
                     output = await _read_async_response(response)
                     self._release_worker(worker_url)
+                    if self.verbose:
+                        logger.debug(
+                            "[router] success request_id=%s method=%s endpoint=%s worker=%s status=%s attempt=%d "
+                            "elapsed_ms=%.1f",
+                            request_id,
+                            request.method,
+                            endpoint,
+                            worker_url,
+                            response.status,
+                            attempt_idx,
+                            (time.monotonic() - attempt_start) * 1000,
+                        )
                     return output
-            except asyncio.TimeoutError:
-                logger.warning(f"Async request to {endpoint} timed out (attempt {attempt + 1})")
-            except aiohttp.ClientConnectorError:
-                logger.warning(f"Connection error for {endpoint} (attempt {attempt + 1})")
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "Async request timed out endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s "
+                    "elapsed_ms=%.1f error=%r",
+                    endpoint,
+                    attempt_idx,
+                    self.max_attempts,
+                    worker_url,
+                    target_url,
+                    request_id,
+                    (time.monotonic() - attempt_start) * 1000,
+                    e,
+                )
+            except aiohttp.ClientConnectorError as e:
+                logger.warning(
+                    "Connection error for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s "
+                    "elapsed_ms=%.1f error=%r",
+                    endpoint,
+                    attempt_idx,
+                    self.max_attempts,
+                    worker_url,
+                    target_url,
+                    request_id,
+                    (time.monotonic() - attempt_start) * 1000,
+                    e,
+                )
             except aiohttp.ClientResponseError as e:
-                logger.error(f"HTTP error for {endpoint}: {e}")
+                logger.error(
+                    "HTTP error for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s status=%s message=%s",
+                    endpoint,
+                    attempt_idx,
+                    self.max_attempts,
+                    worker_url,
+                    target_url,
+                    request_id,
+                    e.status,
+                    e.message,
+                )
                 raise
             except Exception as e:
-                logger.error(f"Unexpected error for {endpoint}: {e}")
+                logger.error(
+                    "Unexpected error for endpoint=%s attempt=%d/%d worker=%s target=%s request_id=%s "
+                    "elapsed_ms=%.1f error=%r",
+                    endpoint,
+                    attempt_idx,
+                    self.max_attempts,
+                    worker_url,
+                    target_url,
+                    request_id,
+                    (time.monotonic() - attempt_start) * 1000,
+                    e,
+                )
                 if attempt == self.max_attempts - 1:
                     raise
 
             if attempt < self.max_attempts - 1:
                 await asyncio.sleep(self.retry_delay * (2**attempt))
 
+        logger.error(
+            "Failed to complete request endpoint=%s method=%s request_id=%s after %d attempts; "
+            "last_target=%s body_bytes=%d available_workers=%s",
+            endpoint,
+            request.method,
+            request_id,
+            self.max_attempts,
+            target_url,
+            body_size,
+            self.worker_urls,
+        )
         raise RuntimeError(f"Failed to complete async request to {endpoint} after {self.max_attempts} attempts")
 
     def _select_worker(self) -> str:
