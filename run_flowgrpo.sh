@@ -40,3 +40,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 bash examples/flowgrpo_trainer/run_flowgrpo_nocfg.s
   data.val_files=/workspace/data/ocr/test.parquet \
   hydra.run.dir=$LOG_DIR \
   hydra.output_subdir=null \
+  +ray_kwargs.ray_init._temp_dir=/workspace/ray_tmp \
+

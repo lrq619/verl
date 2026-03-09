@@ -76,7 +76,7 @@ def launch_router_process(
 
 def run_router(router_ip: str, router_port: int, worker_urls: list[str]):
     router = NaiveRouter(worker_urls=worker_urls, verbose=False)
-    uvicorn.run(router.app, host=router_ip, port=router_port, log_level="warning")
+    uvicorn.run(router.app, host=router_ip, port=router_port, log_level="info")
 
 
 class NaiveRouter:
