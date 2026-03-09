@@ -350,14 +350,13 @@ class vLLMHttpServer:
             # vLLM >= 0.13.0 supports profiler config via CLI args; env vars still work but will be deprecated
             args.update(profiler_args)
 
-        if self.config.prometheus.enable:
-            if self.config.prometheus.served_model_name:
-                # Extract model name from path if it's a full path
-                served_model_name = self.config.prometheus.served_model_name
-                if "/" in served_model_name:
-                    # If it's a full path, extract the last part as model name
-                    served_model_name = served_model_name.split("/")[-1]
-                args["served_model_name"] = served_model_name
+        if self.config.prometheus.served_model_name:
+            # Extract model name from path if it's a full path
+            served_model_name = self.config.prometheus.served_model_name
+            if "/" in served_model_name:
+                # If it's a full path, extract the last part as model name
+                served_model_name = served_model_name.split("/")[-1]
+            args["served_model_name"] = served_model_name
 
         # mtp
         if self.config.mtp.enable and self.config.mtp.enable_rollout:

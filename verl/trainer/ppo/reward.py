@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import multiprocessing
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from verl.experimental.reward_loop.reward_manager.base import RawRewardFn, RewardManagerBase
     from verl.trainer.config.config import ModuleConfig
     from verl.workers.config.reward import RewardManagerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
@@ -80,6 +83,19 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     raw_fn = load_extern_object(module_path=module_path, object_name=fn_name)
 
     reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
+    sig = inspect.signature(raw_fn)
+    accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if not accepts_var_kwargs and reward_kwargs:
+        accepted = set(sig.parameters.keys())
+        dropped_keys = sorted([k for k in reward_kwargs if k not in accepted])
+        if dropped_keys:
+            logger.warning(
+                "Dropping unsupported custom reward kwargs for %s: %s",
+                fn_name,
+                dropped_keys,
+            )
+            reward_kwargs = {k: v for k, v in reward_kwargs.items() if k in accepted}
+
     if not inspect.iscoroutinefunction(raw_fn):
         return partial(_call_with_kwargs, raw_fn, reward_kwargs)
     else:

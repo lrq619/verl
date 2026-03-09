@@ -128,6 +128,28 @@ class RewardLoopWorker:
             reward_model_tokenizer_local_path = copy_to_local(self.config.reward.reward_model.model_path)
             self.reward_model_tokenizer = hf_tokenizer(reward_model_tokenizer_local_path, trust_remote_code=True)
 
+            # Keep reward request model id aligned with vLLM served model name to avoid 404 NotFoundError.
+            served_model_name = self.config.reward.reward_model.rollout.prometheus.served_model_name
+            if served_model_name:
+                request_model_name = served_model_name.split("/")[-1]
+            else:
+                request_model_name = self.config.reward.reward_model.model_path
+
+            if self.config.reward.custom_reward_function.path is not None and request_model_name:
+                with open_dict(self.config):
+                    reward_fn_cfg = self.config.reward.custom_reward_function
+                    reward_kwargs = reward_fn_cfg.get("reward_kwargs")
+                    if reward_kwargs is None:
+                        reward_fn_cfg["reward_kwargs"] = {}
+                    self.config.reward.custom_reward_function.reward_kwargs.setdefault("model_name", request_model_name)
+                logger.warning(
+                    "[RM_STARTUP] reward custom function default model_name=%s "
+                    "(served_model_name=%s model_path=%s)",
+                    request_model_name,
+                    served_model_name,
+                    self.config.reward.reward_model.model_path,
+                )
+
         self.reward_manager = load_reward_manager(
             self.config,
             self.input_tokenizer,
