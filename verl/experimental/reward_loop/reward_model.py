@@ -15,7 +15,9 @@
 import asyncio
 import logging
 import os
+import time
 
+import aiohttp
 from verl.single_controller.ray.base import RayResourcePool, split_resource_pool
 from verl.workers.config import HFModelConfig, RewardModelConfig
 from verl.workers.rollout.replica import get_rollout_replica_class
@@ -41,13 +43,17 @@ class RewardModelManager:
         """
         self.config = config
         self.resource_pool = resource_pool
+        logger.info("=== [RM_STARTUP] BEGIN RewardModelManager init ===")
         self._initialize_llm_servers()
         self._initialize_router()
+        self._verify_servers_ready()
         assert self.config.rollout.skip_tokenizer_init is False, "Reward model should not skip tokenizer init."
         if self.config.rollout.free_cache_engine:
             self.sleep()
+        logger.info("=== [RM_STARTUP] END RewardModelManager init ===")
 
     def _initialize_llm_servers(self):
+        logger.info("=== [RM_STARTUP] Step 1/3: launching reward model rollout replicas ===")
         rollout_world_size = self.config.rollout.tensor_model_parallel_size
         world_size = (
             self.resource_pool.world_size
@@ -94,8 +100,10 @@ class RewardModelManager:
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
         logger.info("Reward model server addresses: %s", self.server_addresses)
+        logger.info("=== [RM_STARTUP] Step 1/3 done: rollout replicas launched ===")
 
     def _initialize_router(self):
+        logger.info("=== [RM_STARTUP] Step 2/3: launching reward router ===")
         worker_urls = [f"http://{server_address}" for server_address in self.server_addresses]
         logger.info("Launching reward router with worker URLs: %s", worker_urls)
 
@@ -109,6 +117,117 @@ class RewardModelManager:
 
         self.router_address, _ = launch_router_process(worker_urls=worker_urls)
         logger.info("Reward router launched at %s", self.router_address)
+        logger.info("=== [RM_STARTUP] Step 2/3 done: reward router launched ===")
+
+    def _verify_servers_ready(self):
+        """Probe reward workers and router with simple HTTP GET /health requests."""
+        enabled = os.getenv("VERL_RM_STARTUP_PROBE", "1").lower() not in {"0", "false", "off"}
+        if not enabled:
+            logger.info("=== [RM_STARTUP] Step 3/3 skipped: probe disabled by VERL_RM_STARTUP_PROBE ===")
+            return
+
+        timeout_s = float(os.getenv("VERL_RM_STARTUP_PROBE_TIMEOUT_S", "120"))
+        interval_s = float(os.getenv("VERL_RM_STARTUP_PROBE_INTERVAL_S", "2"))
+        logger.info(
+            "=== [RM_STARTUP] Step 3/3: probing HTTP readiness (timeout=%.1fs interval=%.1fs) ===",
+            timeout_s,
+            interval_s,
+        )
+
+        worker_urls = [f"http://{server_address}" for server_address in self.server_addresses]
+        router_url = f"http://{self.router_address}"
+        asyncio.run(
+            self._verify_servers_ready_async(
+                worker_urls=worker_urls,
+                router_url=router_url,
+                timeout_s=timeout_s,
+                interval_s=interval_s,
+            )
+        )
+        logger.info("=== [RM_STARTUP] Step 3/3 done: HTTP probe passed for all workers and router ===")
+
+    async def _verify_servers_ready_async(
+        self,
+        worker_urls: list[str],
+        router_url: str,
+        timeout_s: float,
+        interval_s: float,
+    ):
+        timeout = aiohttp.ClientTimeout(total=min(timeout_s, 10.0), connect=min(timeout_s, 5.0))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for idx, url in enumerate(worker_urls):
+                await self._probe_health_with_retry(
+                    session=session,
+                    base_url=url,
+                    server_name=f"reward_worker[{idx}]",
+                    timeout_s=timeout_s,
+                    interval_s=interval_s,
+                )
+            await self._probe_health_with_retry(
+                session=session,
+                base_url=router_url,
+                server_name="reward_router",
+                timeout_s=timeout_s,
+                interval_s=interval_s,
+            )
+
+    async def _probe_health_with_retry(
+        self,
+        session: aiohttp.ClientSession,
+        base_url: str,
+        server_name: str,
+        timeout_s: float,
+        interval_s: float,
+    ):
+        health_url = f"{base_url}/health"
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        last_err = "unknown"
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                async with session.get(health_url) as resp:
+                    body = await resp.text()
+                    if resp.status == 200:
+                        logger.info(
+                            "[RM_STARTUP][probe] %s is ready: url=%s status=%s attempt=%d",
+                            server_name,
+                            health_url,
+                            resp.status,
+                            attempt,
+                        )
+                        return
+
+                    # Some servers may not expose /health but still indicate process is alive.
+                    if resp.status in (404, 405):
+                        logger.warning(
+                            "[RM_STARTUP][probe] %s returned status=%s on /health; treating as reachable: url=%s "
+                            "attempt=%d",
+                            server_name,
+                            resp.status,
+                            health_url,
+                            attempt,
+                        )
+                        return
+
+                    preview = body[:200].replace("\n", "\\n")
+                    last_err = f"status={resp.status} body_preview={preview}"
+            except Exception as e:  # noqa: BLE001
+                last_err = repr(e)
+
+            logger.warning(
+                "[RM_STARTUP][probe] %s not ready yet: url=%s attempt=%d last_err=%s",
+                server_name,
+                health_url,
+                attempt,
+                last_err,
+            )
+            await asyncio.sleep(interval_s)
+
+        raise RuntimeError(
+            f"[RM_STARTUP][probe] {server_name} failed readiness check: url={health_url}, "
+            f"timeout_s={timeout_s}, last_err={last_err}"
+        )
 
     def get_router_address(self):
         return self.router_address
