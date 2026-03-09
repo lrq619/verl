@@ -22,7 +22,7 @@ import aiohttp
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image
 from tensordict import TensorDict
 
@@ -129,7 +129,11 @@ class RewardLoopWorker:
             self.reward_model_tokenizer = hf_tokenizer(reward_model_tokenizer_local_path, trust_remote_code=True)
 
             # Keep reward request model id aligned with vLLM served model name to avoid 404 NotFoundError.
-            served_model_name = self.config.reward.reward_model.rollout.prometheus.served_model_name
+            served_model_name = OmegaConf.select(
+                self.config,
+                "reward.reward_model.rollout.prometheus.served_model_name",
+                default=None,
+            )
             if served_model_name:
                 request_model_name = served_model_name.split("/")[-1]
             else:
