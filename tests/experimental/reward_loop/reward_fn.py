@@ -58,7 +58,7 @@ async def compute_score_gsm8k(
     grm_prompt = GRM_PROMPT_TEMPLATE.format(problem=extra_info["question"], solution=solution_str)
     messages = [{"role": "user", "content": grm_prompt}]
     sampling_params = {"temperature": 0.7, "top_p": 0.8, "max_tokens": 4096}
-    model_name = os.path.expanduser("~/models/Qwen/Qwen2.5-1.5B-Instruct")
+    model_name = os.path.expanduser("~/models/Qwen/Qwen2.5-3B-Instruct")
     chat_complete_request = {"messages": messages, "model": model_name, **sampling_params}
     result = await chat_complete(router_address=reward_router_address, chat_complete_request=chat_complete_request)
     grm_response = result.choices[0].message.content

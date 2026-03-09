@@ -20,6 +20,7 @@ import os
 from pprint import pprint
 from typing import Any, Callable, Optional
 import torch
+from dataclasses import asdict
 
 import ray
 import torchvision.transforms as T
@@ -361,22 +362,17 @@ class vLLMOmniHttpServer:
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncOmniEngineArgs.from_cli_args(args)
 
-        kwargs = {
-            "model": engine_args.model,
-            "enable_sleep_mode": engine_args.enable_sleep_mode,
-            "worker_extension_cls": engine_args.worker_extension_cls,
-            "enforce_eager": engine_args.enforce_eager,
-        }
+        engine_args = asdict(engine_args)
 
         # TODO (mike): read custom_pipeline from CLI
         custom_pipeline = self.config.engine_kwargs.get("vllm_omni", {}).get("custom_pipeline", None)
         if custom_pipeline is not None:
-            kwargs["custom_pipeline"] = custom_pipeline
-            kwargs["enable_dummy_pipeline"] = True
-            kwargs["custom_pipeline_args"] = {"pipeline_class": custom_pipeline}
+            engine_args["custom_pipeline"] = custom_pipeline
+            engine_args["enable_dummy_pipeline"] = True
+            engine_args["custom_pipeline_args"] = {"pipeline_class": custom_pipeline}
 
         # TODO (mike): support parsing engine config from CLI
-        engine_client = AsyncOmni(**kwargs)
+        engine_client = AsyncOmni(**engine_args)
         app = build_app(args)
         # vllm-omni changed omni_init_app_state signature across versions.
         # Support both:

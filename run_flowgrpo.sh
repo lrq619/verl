@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_DIR=/workspace/verl/logs
+LOG_DIR=./logs
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/flowgrpo_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -12,9 +12,9 @@ REWARD_IMG=/hf_home/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d
 
 export VERL_VLLM_RPC_TIMEOUT_S=600
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash examples/flowgrpo_trainer/run_flowgrpo_nocfg.sh \
-  trainer.n_gpus_per_node=8 \
-  trainer.logger='["console","wandb"]' \
+CUDA_VISIBLE_DEVICES=0,1,2,3 bash examples/flowgrpo_trainer/run_flowgrpo_nocfg.sh \
+  trainer.n_gpus_per_node=4 \
+  trainer.logger='["console"]' \
   +trainer.skip_initial_update_weights=True \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -38,5 +38,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 bash examples/flowgrpo_trainer/run_flowgrpo
   data.val_max_samples=16 \
   data.train_files=/workspace/data/ocr/train.parquet \
   data.val_files=/workspace/data/ocr/test.parquet \
-  hydra.run.dir=/workspace/verl/logs \
+  hydra.run.dir=$LOG_DIR \
   hydra.output_subdir=null \

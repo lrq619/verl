@@ -11,6 +11,7 @@ Optionally it can initialize AsyncOmni or run the HTTP server.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import asyncio
 import inspect
 import json
@@ -132,13 +133,8 @@ def _parse_and_validate_with_vllm_omni(cli_args: list[str]) -> argparse.Namespac
 
 async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
     engine_args = AsyncOmniEngineArgs.from_cli_args(ns)
-    kwargs = {
-        "model": engine_args.model,
-        "enable_sleep_mode": engine_args.enable_sleep_mode,
-        "worker_extension_cls": engine_args.worker_extension_cls,
-        "enforce_eager": engine_args.enforce_eager,
-    }
-    engine_client = AsyncOmni(**kwargs)
+    engine_args = asdict(engine_args)
+    engine_client = AsyncOmni(**engine_args)
 
     print("[OK] AsyncOmni initialized")
 

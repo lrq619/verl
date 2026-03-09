@@ -1,4 +1,4 @@
-# enroot create --name verl-ali /scratch/users/ntu/ruiqi003/sqsh_images/verl-ali.sqsh
+enroot create --name verl-ali /scratch/users/ntu/ruiqi003/sqsh_images/verl-ali.sqsh
 enroot start \
   --root \
   --rw \
