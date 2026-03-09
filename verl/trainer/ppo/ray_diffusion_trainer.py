@@ -499,7 +499,15 @@ class RayFlowGRPOTrainer:
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
+                print(
+                    "[SLEEP_TRACE][ROLLOUT][BEFORE] validation rollout finished, sleep_replicas before reward.",
+                    flush=True,
+                )
                 self.checkpoint_manager.sleep_replicas()
+                print(
+                    "[SLEEP_TRACE][ROLLOUT][AFTER] validation sleep_replicas completed.",
+                    flush=True,
+                )
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
@@ -1302,8 +1310,15 @@ class RayFlowGRPOTrainer:
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         print(f"Finished generation!")
                         self._stage_end(f"Start gen of the epoch: {epoch}, batch: {i}")
+                        print(
+                            "[SLEEP_TRACE][ROLLOUT][BEFORE] training rollout generation finished, sleep_replicas.",
+                            flush=True,
+                        )
                         self.checkpoint_manager.sleep_replicas()
-                        print(f"replicas sleep!")
+                        print(
+                            "[SLEEP_TRACE][ROLLOUT][AFTER] training sleep_replicas completed.",
+                            flush=True,
+                        )
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 

@@ -553,9 +553,46 @@ class vLLMOmniHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
+    def _format_gpu_memory_used_total_gb(self) -> str:
+        """Return visible GPU memory usage as `used/total` in GB for each local device."""
+        try:
+            if not torch.cuda.is_available():
+                return "cuda_unavailable"
+
+            stats = []
+            for idx in range(torch.cuda.device_count()):
+                with torch.cuda.device(idx):
+                    free_bytes, total_bytes = torch.cuda.mem_get_info()
+                used_bytes = total_bytes - free_bytes
+                stats.append(
+                    f"cuda:{idx}={used_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f}GB"
+                )
+            return ", ".join(stats) if stats else "no_visible_gpu"
+        except Exception as e:  # noqa: BLE001
+            return f"gpu_mem_error={e!r}"
+
     async def sleep(self):
+        mem_before = self._format_gpu_memory_used_total_gb()
+
         if self.node_rank != 0 or not self.config.free_cache_engine:
+            logger.warning(
+                "[SLEEP_MEM][ROLLOUT][SKIP] replica_rank=%s node_rank=%s rollout_mode=%s free_cache_engine=%s "
+                "gpu_mem=%s",
+                self.replica_rank,
+                self.node_rank,
+                self.rollout_mode,
+                self.config.free_cache_engine,
+                mem_before,
+            )
             return
+
+        logger.warning(
+            "[SLEEP_MEM][ROLLOUT][BEFORE] replica_rank=%s node_rank=%s rollout_mode=%s gpu_mem=%s",
+            self.replica_rank,
+            self.node_rank,
+            self.rollout_mode,
+            mem_before,
+        )
 
         if self.rollout_mode == RolloutMode.HYBRID:
             await self.engine.sleep(level=2)
@@ -563,6 +600,15 @@ class vLLMOmniHttpServer:
             await self.engine.sleep(level=2)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
+
+        mem_after = self._format_gpu_memory_used_total_gb()
+        logger.warning(
+            "[SLEEP_MEM][ROLLOUT][AFTER] replica_rank=%s node_rank=%s rollout_mode=%s gpu_mem=%s",
+            self.replica_rank,
+            self.node_rank,
+            self.rollout_mode,
+            mem_after,
+        )
 
     async def start_profile(self, **kwargs):
         if (

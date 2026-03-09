@@ -399,7 +399,13 @@ class RewardLoopManager:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         if self.reward_model_manager is not None:
+            logger.warning(
+                "[SLEEP_TRACE][REWARD][BEFORE] reward scoring finished, going to sleep reward model servers."
+            )
             self.reward_model_manager.sleep()
+            logger.warning(
+                "[SLEEP_TRACE][REWARD][AFTER] reward model servers sleep completed."
+            )
 
         return DataProto(
             batch=batch, non_tensor_batch=non_tensor_batch, meta_info={"reward_extra_keys": reward_extra_keys}

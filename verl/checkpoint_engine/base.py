@@ -393,9 +393,15 @@ class CheckpointEngineManager:
         if self.backend != "naive":
             return
         t0 = time.monotonic()
-        _sync_log("sleep_replicas", f"START replicas={len(self.replicas)} backend={self.backend}")
+        _sync_log(
+            "sleep_replicas",
+            f"[SLEEP_TRACE][ROLLOUT][BEFORE] replicas={len(self.replicas)} backend={self.backend}",
+        )
         await asyncio.gather(*[r.sleep() for r in self.replicas])
-        _sync_log("sleep_replicas", f"END elapsed={time.monotonic() - t0:.3f}s")
+        _sync_log(
+            "sleep_replicas",
+            f"[SLEEP_TRACE][ROLLOUT][AFTER] elapsed={time.monotonic() - t0:.3f}s",
+        )
 
     @auto_await
     async def update_weights(self):

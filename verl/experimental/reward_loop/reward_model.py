@@ -238,7 +238,14 @@ class RewardModelManager:
 
     def sleep(self):
         """Sleep all rollout replica instances."""
+        logger.warning(
+            "[SLEEP_TRACE][REWARD][DISPATCH][BEFORE] sleep reward replicas count=%d",
+            len(self.rollout_replicas),
+        )
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
+        logger.warning(
+            "[SLEEP_TRACE][REWARD][DISPATCH][AFTER] sleep reward replicas completed."
+        )
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
