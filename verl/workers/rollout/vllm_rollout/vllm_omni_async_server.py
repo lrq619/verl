@@ -31,7 +31,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTokensPrompt
 from vllm_omni.entrypoints import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import build_app, omni_init_app_state
+from vllm_omni.entrypoints.openai.api_server import build_omni_app, omni_init_app_state
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -373,7 +373,7 @@ class vLLMOmniHttpServer:
 
         # TODO (mike): support parsing engine config from CLI
         engine_client = AsyncOmni(**engine_args)
-        app = build_app(args)
+        app = build_omni_app(args)
         # vllm-omni changed omni_init_app_state signature across versions.
         # Support both:
         # - (engine_client, middlewares, state, args)
