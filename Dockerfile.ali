@@ -66,8 +66,9 @@ RUN ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
 # Ensure `pip` command is available in PATH as required by Ali custom-image checks.
 RUN ln -sf /usr/local/bin/pip /usr/bin/pip || true
 
-# Useful Python tooling only (no verl/vllm install here).
-RUN python -m pip install --upgrade pip setuptools wheel uv
+# Install uv without relying on pip install.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    ln -sf /root/.local/bin/uv /usr/local/bin/uv
 
 # Shared writable venv location managed by uv.
 ARG VENV=/opt/env
@@ -91,18 +92,22 @@ WORKDIR /workspace
 COPY ./data /workspace/data/ocr
 RUN chmod -R a+rX /workspace/data
 
-# Use uv to create env in /opt and make subsequent pip installs target it.
-RUN uv venv "${VENV}" --python /usr/bin/python3.12
+# Use uv to create env in /opt and make subsequent installs target it.
+RUN uv venv --seed "${VENV}" --python /usr/bin/python3.12
 
-RUN pip install vllm==0.16.0
+# Keep core packaging tools in the managed venv.
+RUN uv pip install --python "${VENV}/bin/python" --upgrade pip setuptools wheel
 
-RUN git clone git@github.com:lrq619/vllm-omni.git /workspace/vllm-omni && \
+RUN uv pip install --python "${VENV}/bin/python" vllm==0.16.0
+
+RUN git clone https://github.com/lrq619/vllm-omni.git /workspace/vllm-omni && \
     cd /workspace/vllm-omni && \
     git checkout verl-train && \
-    pip install -e .
+    uv pip install --python "${VENV}/bin/python" -e .
 
 COPY ./requirements.txt /workspace/requirements.txt
-RUN pip install -r /workspace/requirements.txt
+RUN uv pip install --python "${VENV}/bin/python" -r /workspace/requirements.txt
+RUN uv pip install --python "${VENV}/bin/python" packaging numpy ray tensordict omegaconf
 
 RUN chmod -R a+rwX "${VENV}"
 
