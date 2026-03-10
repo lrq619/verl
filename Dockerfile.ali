@@ -69,6 +69,11 @@ RUN ln -sf /usr/local/bin/pip /usr/bin/pip || true
 # Useful Python tooling only (no verl/vllm install here).
 RUN python -m pip install --upgrade pip setuptools wheel uv
 
+# Shared writable venv location managed by uv.
+ARG VENV=/opt/env
+ENV VIRTUAL_ENV=${VENV}
+ENV PATH="${VENV}/bin:/root/.local/bin:${PATH}"
+
 # Optional but recommended by Ali custom-image docs:
 # create admin user with uid != 1000 for sudo terminal compatibility.
 ARG ADMIN_USER=admin
@@ -86,15 +91,19 @@ WORKDIR /workspace
 COPY ./data /workspace/data/ocr
 RUN chmod -R a+rX /workspace/data
 
-# 把本地 env 拷进镜像（build context 里要有 ./env）
-COPY ./env /opt/env
+# Use uv to create env in /opt and make subsequent pip installs target it.
+RUN uv venv "${VENV}" --python /usr/bin/python3.12
 
-# 让“当前和未来”在 /opt/env 下的文件都对所有用户可读写执行
-RUN apt-get update && apt-get install -y --no-install-recommends acl \
- && setfacl -R -m u::rwx,g::rwx,o::rwx /opt/env \
- && find /opt/env -type d -exec setfacl -d -m u::rwx,g::rwx,o::rwx {} \; \
- && rm -rf /var/lib/apt/lists/*
+RUN pip install vllm==0.16.0
 
-RUN mkdir -p /workspace/verl && ln -sfn /opt/env /workspace/verl/env
+RUN git clone git@github.com:lrq619/vllm-omni.git /workspace/vllm-omni && \
+    cd /workspace/vllm-omni && \
+    git checkout verl-train && \
+    pip install -e .
+
+COPY ./requirements.txt /workspace/requirements.txt
+RUN pip install -r /workspace/requirements.txt
+
+RUN chmod -R a+rwX "${VENV}"
 
 CMD ["bash"]
