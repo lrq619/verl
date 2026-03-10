@@ -19,11 +19,14 @@ import shlex
 import sys
 from typing import Any
 
+import torch
 import vllm_omni.entrypoints.cli.serve
+from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
 from vllm_omni.entrypoints import AsyncOmni
-from vllm_omni.entrypoints.openai.api_server import build_app, omni_init_app_state
+from vllm_omni.entrypoints.openai.api_server import build_openai_app, omni_init_app_state
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl.workers.rollout.utils import run_unvicorn
 from verl.workers.rollout.vllm_rollout.utils import build_cli_args_from_config
@@ -45,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--scheduling-policy", default="fcfs")
     p.add_argument("--compilation-config", default='{"cudagraph_mode":"NONE"}')
+    p.add_argument("--enable-sleep-mode", default=True)
 
     # These are the fields you asked about.
     p.add_argument("--stage-init-timeout", type=int, default=None)
@@ -131,17 +135,142 @@ def _parse_and_validate_with_vllm_omni(cli_args: list[str]) -> argparse.Namespac
     return ns
 
 
+def _format_gpu_memory_used_total_gb() -> str:
+    """Return visible GPU memory usage as `used/total` in GB for each local device."""
+    try:
+        if not torch.cuda.is_available():
+            return "cuda_unavailable"
+
+        stats = []
+        for idx in range(torch.cuda.device_count()):
+            with torch.cuda.device(idx):
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+            used_bytes = total_bytes - free_bytes
+            stats.append(f"cuda:{idx}={used_bytes / (1024**3):.2f}/{total_bytes / (1024**3):.2f}GB")
+        return ", ".join(stats) if stats else "no_visible_gpu"
+    except Exception as e:  # noqa: BLE001
+        return f"gpu_mem_error={e!r}"
+
+
+async def _sleep_engine(engine_client: AsyncOmni, level: int = 2) -> None:
+    """Sleep engine with compatibility across vLLM-Omni API variants."""
+    if hasattr(engine_client, "sleep"):
+        await engine_client.sleep(level=level)
+        return
+    if hasattr(engine_client, "collective_rpc"):
+        await engine_client.collective_rpc(method="sleep", kwargs={"level": level})
+        return
+    raise AttributeError("Engine has neither `sleep` nor `collective_rpc` method")
+
+
+async def _wake_up_engine(engine_client: AsyncOmni, tags: list[str] | None = None) -> None:
+    """Wake engine with compatibility across vLLM-Omni API variants."""
+    if hasattr(engine_client, "wake_up"):
+        await engine_client.wake_up(tags=tags)
+        return
+    if hasattr(engine_client, "wakeup"):
+        wakeup = getattr(engine_client, "wakeup")
+        try:
+            await wakeup(tags=tags)
+        except TypeError:
+            await wakeup()
+        return
+    if hasattr(engine_client, "collective_rpc"):
+        try:
+            await engine_client.collective_rpc(method="wake_up", kwargs={"tags": tags})
+        except Exception:
+            await engine_client.collective_rpc(method="wakeup", kwargs={"tags": tags})
+        return
+    raise AttributeError("Engine has neither `wake_up`/`wakeup` nor `collective_rpc` method")
+
+
+def _build_dummy_sampling_params_list(engine_client: AsyncOmni) -> list[Any]:
+    """Build lightweight per-stage sampling params for a quick dummy request."""
+    params_list: list[Any] = []
+    for stage in getattr(engine_client, "stage_list", []):
+        stage_type = str(getattr(stage, "stage_type", "")).lower()
+        if stage_type == "diffusion":
+            params_list.append(
+                OmniDiffusionSamplingParams(
+                    num_inference_steps=1,
+                    num_outputs_per_prompt=1,
+                    height=256,
+                    width=256,
+                )
+            )
+        else:
+            params_list.append(SamplingParams(max_tokens=1, temperature=0.0))
+    return params_list
+
+
+def _safe_sorted_keys(value: Any) -> list[str] | None:
+    if isinstance(value, dict):
+        return sorted(str(k) for k in value.keys())
+    return None
+
+
+async def _dummy_request_and_report(engine_client: AsyncOmni) -> None:
+    """Send a dummy internal request and print multimodal output schema checks."""
+    request_id = f"sim-dummy-{int(asyncio.get_running_loop().time() * 1000)}"
+    sampling_params_list = _build_dummy_sampling_params_list(engine_client)
+    if not sampling_params_list:
+        print("[DUMMY_CHECK][SKIP] empty stage_list; cannot send dummy request")
+        return
+
+    async def _collect_last_output() -> Any:
+        last_output = None
+        async for output in engine_client.generate(
+            prompt="a tiny white cat",
+            request_id=request_id,
+            sampling_params_list=sampling_params_list,
+        ):
+            last_output = output
+        return last_output
+
+    try:
+        final_output = await asyncio.wait_for(_collect_last_output(), timeout=300)
+    except Exception as e:  # noqa: BLE001
+        print(f"[DUMMY_CHECK][ERROR] failed to run dummy request: {e!r}")
+        return
+
+    if final_output is None:
+        print("[DUMMY_CHECK][ERROR] dummy request returned no output")
+        return
+
+    output_dict = final_output.to_dict() if hasattr(final_output, "to_dict") else {}
+    print(f"[DUMMY_CHECK] final_output_type={type(final_output).__name__}")
+    print(f"[DUMMY_CHECK] output_dict_keys={sorted(output_dict.keys())}")
+    multimodal_output = final_output.multimodal_output
+    print(f"[DUMMY_CHECK] has_output_field_multimodal_output={hasattr(final_output, "multimodal_output")}")
+    print(f"[DUMMY_CHECK] multimodal_output keys: {multimodal_output.keys()}")
+
+
+
+
+
 async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
     engine_args = AsyncOmniEngineArgs.from_cli_args(ns)
     engine_args = asdict(engine_args)
     engine_client = AsyncOmni(**engine_args)
 
     print("[OK] AsyncOmni initialized")
+    print(f"[SLEEP_MEM][SIM][BEFORE_WAIT] gpu_mem={_format_gpu_memory_used_total_gb()}")
+    print("[SLEEP_MEM][SIM] waiting 3 seconds before calling engine.sleep(level=2)")
+    await asyncio.sleep(3)
+    print(f"[SLEEP_MEM][SIM][BEFORE_SLEEP] gpu_mem={_format_gpu_memory_used_total_gb()}")
+    await _sleep_engine(engine_client, level=2)
+    print(f"[SLEEP_MEM][SIM][AFTER_SLEEP] gpu_mem={_format_gpu_memory_used_total_gb()}")
+    print("[SLEEP_MEM][SIM] waiting 3 seconds before calling engine.wake_up(...)")
+    await asyncio.sleep(3)
+    print(f"[SLEEP_MEM][SIM][BEFORE_WAKE_UP] gpu_mem={_format_gpu_memory_used_total_gb()}")
+    await _wake_up_engine(engine_client)
+    print(f"[SLEEP_MEM][SIM][AFTER_WAKE_UP] gpu_mem={_format_gpu_memory_used_total_gb()}")
+    await _dummy_request_and_report(engine_client)
 
     if mode != "serve":
         return
 
-    app = build_app(ns)
+    app = build_openai_app(ns)
     if len(inspect.signature(omni_init_app_state).parameters) >= 4:
         await omni_init_app_state(engine_client, None, app.state, ns)
     else:
