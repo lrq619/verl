@@ -29,6 +29,7 @@ When working with Megatron:
 import asyncio
 import logging
 import os
+import time
 from typing import Any, Optional
 
 import ray
@@ -42,6 +43,10 @@ from verl.workers.rollout.vllm_rollout.vllm_rollout import ServerAdapter
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _omni_client_log(stage: str, message: str):
+    logger.warning("[OMNI_CLIENT][%s] %s", stage, message)
 
 
 class vLLMOmniServerAdapter(ServerAdapter):
@@ -105,20 +110,47 @@ class vLLMOmniServerAdapter(ServerAdapter):
             The result of the method execution, or None if non_block=True.
         """
         if self.rollout_rank != 0:
+            _omni_client_log(
+                "_execute_method.skip",
+                f"method={method} rollout_rank={self.rollout_rank} replica_rank={self.replica_rank} node_rank={self.node_rank}",
+            )
             return None
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_omni_server_{self.replica_rank}_{self.node_rank}")
+            actor_name = f"vllm_omni_server_{self.replica_rank}_{self.node_rank}"
+            _omni_client_log("_execute_method.get_actor.START", f"method={method} actor={actor_name}")
+            self.server_handle = ray.get_actor(actor_name)
+            _omni_client_log("_execute_method.get_actor.END", f"method={method} actor={actor_name}")
 
+        t0 = time.monotonic()
+        _omni_client_log(
+            "_execute_method.dispatch.START",
+            f"method={method} non_block={non_block} timeout={timeout} args_len={len(args)} kwargs_keys={sorted((kwargs or {}).keys())}",
+        )
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
+        _omni_client_log(
+            "_execute_method.dispatch.END",
+            f"method={method} non_block={non_block} elapsed={time.monotonic() - t0:.3f}s",
+        )
         if non_block:
+            _omni_client_log("_execute_method.return_future", f"method={method}")
             return future
 
         rpc_timeout = timeout if timeout is not None else float(os.getenv("VERL_VLLM_RPC_TIMEOUT_S", "1800"))
         try:
-            return await asyncio.wait_for(future, timeout=rpc_timeout)
+            _omni_client_log("_execute_method.await.START", f"method={method} rpc_timeout={rpc_timeout}")
+            result = await asyncio.wait_for(future, timeout=rpc_timeout)
+            _omni_client_log(
+                "_execute_method.await.END",
+                f"method={method} elapsed={time.monotonic() - t0:.3f}s result_type={type(result).__name__}",
+            )
+            return result
         except TimeoutError as e:
+            _omni_client_log(
+                "_execute_method.await.TIMEOUT",
+                f"method={method} rpc_timeout={rpc_timeout} elapsed={time.monotonic() - t0:.3f}s",
+            )
             raise TimeoutError(
                 f"Timed out waiting for vLLM-Omni rpc method `{method}` after {rpc_timeout}s. "
                 "This usually means rollout server init/wake_up is stuck."

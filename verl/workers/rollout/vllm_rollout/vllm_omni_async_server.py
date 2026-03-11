@@ -20,6 +20,7 @@ import os
 from pprint import pprint
 from typing import Any, Callable, Optional
 import torch
+import time
 from dataclasses import asdict
 
 import ray
@@ -54,6 +55,74 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _omni_rpc_log(stage: str, message: str):
+    logger.warning("[OMNI_RPC][%s] %s", stage, message)
+
+
+async def _dispatch_stage_collective_rpc(
+    stage: Any,
+    method: str | Callable,
+    timeout: float | None,
+    args: tuple,
+    kwargs: dict[str, Any],
+):
+    """Dispatch a worker RPC to a single AsyncOmni stage engine."""
+    engine = getattr(stage, "engine", None)
+    if engine is None:
+        raise AttributeError(f"Stage-{getattr(stage, 'stage_id', 'unknown')} has no engine")
+
+    method_name = getattr(method, "__name__", str(method))
+    if callable(method):
+        return await method(*args, **kwargs)
+
+    fn = getattr(engine, method, None)
+    if callable(fn):
+        return await fn(*args, **kwargs)
+
+    # Diffusion stages expose a sync collective_rpc on engine.engine and serialize
+    # it through a stage-local executor thread.
+    inner_engine = getattr(engine, "engine", None)
+    executor = getattr(engine, "_executor", None)
+    if inner_engine is not None and hasattr(inner_engine, "collective_rpc"):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            executor,
+            inner_engine.collective_rpc,
+            method_name,
+            timeout,
+            args,
+            kwargs,
+            None,
+        )
+
+    # LLM stages expose an async collective RPC on engine_core.
+    engine_core = getattr(engine, "engine_core", None)
+    if engine_core is not None and hasattr(engine_core, "collective_rpc_async"):
+        return await engine_core.collective_rpc_async(method_name, args=args, kwargs=kwargs)
+
+    raise AttributeError(
+        f"Stage-{getattr(stage, 'stage_id', 'unknown')} engine {type(engine).__name__} "
+        f"cannot dispatch method {method_name}"
+    )
+
+
+async def _dispatch_async_omni_method(
+    engine: Any,
+    method: str | Callable,
+    args: tuple,
+    kwargs: dict[str, Any],
+):
+    """Dispatch methods that AsyncOmni exposes directly on the orchestrator."""
+    if callable(method):
+        return await method(*args, **kwargs)
+
+    fn = getattr(engine, method, None)
+    if callable(fn):
+        return await fn(*args, **kwargs)
+
+    raise AttributeError(f"{type(engine).__name__} has no orchestrator method {method!r}")
 
 
 class vLLMOmniHttpServer:
@@ -160,24 +229,73 @@ class vLLMOmniHttpServer:
         kwargs: dict[str, Any] | None = None,
     ):
         kwargs = kwargs or {}
+        method_name = getattr(method, "__name__", str(method))
+        t0 = time.monotonic()
+        _omni_rpc_log(
+            "collective_rpc.START",
+            f"method={method_name} timeout={timeout} args_len={len(args)} kwargs_keys={sorted(kwargs.keys())}",
+        )
         # vllm-omni API changed in newer versions:
         # - old: engine.collective_rpc(method=..., timeout=..., args=..., kwargs=...)
         # - new: direct async methods, e.g. engine.wake_up(tags=...), engine.sleep(level=...)
-        if hasattr(self.engine, "collective_rpc"):
-            await self.engine.collective_rpc(
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=kwargs,
-            )
-            return
+        try:
+            # AsyncOmni orchestrator natively owns lifecycle transitions. These must
+            # go through the orchestrator and not via stage.engine, because stage.engine
+            # only exists inside the stage worker process.
+            if method_name in {"sleep", "wake_up", "update_weights_from_ipc"}:
+                _omni_rpc_log("collective_rpc.async_omni.START", f"method={method_name}")
+                result = await _dispatch_async_omni_method(self.engine, method, args, kwargs)
+                _omni_rpc_log(
+                    "collective_rpc.async_omni.END",
+                    f"method={method_name} elapsed={time.monotonic() - t0:.3f}s",
+                )
+                return result
 
-        if callable(method):
-            await method(*args, **kwargs)
-            return
+            if hasattr(self.engine, "collective_rpc"):
+                _omni_rpc_log("collective_rpc.engine.START", f"method={method_name}")
+                await self.engine.collective_rpc(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                _omni_rpc_log(
+                    "collective_rpc.engine.END",
+                    f"method={method_name} elapsed={time.monotonic() - t0:.3f}s",
+                )
+                return
 
-        fn = getattr(self.engine, method)
-        await fn(*args, **kwargs)
+            if callable(method):
+                _omni_rpc_log("collective_rpc.callable.START", f"method={method_name}")
+                await method(*args, **kwargs)
+                _omni_rpc_log(
+                    "collective_rpc.callable.END",
+                    f"method={method_name} elapsed={time.monotonic() - t0:.3f}s",
+                )
+                return
+
+            if hasattr(self.engine, "stage_list"):
+                stages = getattr(self.engine, "stage_list", []) or []
+                _omni_rpc_log(
+                    "collective_rpc.stages.START",
+                    f"method={method_name} num_stages={len(stages)} stage_ids={[getattr(s, 'stage_id', None) for s in stages]}",
+                )
+                results = await asyncio.gather(
+                    *[_dispatch_stage_collective_rpc(stage, method, timeout, args, kwargs) for stage in stages]
+                )
+                _omni_rpc_log(
+                    "collective_rpc.stages.END",
+                    f"method={method_name} elapsed={time.monotonic() - t0:.3f}s result_count={len(results)}",
+                )
+                return results
+
+            result = await _dispatch_async_omni_method(self.engine, method, args, kwargs)
+            _omni_rpc_log("collective_rpc.direct.END", f"method={method_name} elapsed={time.monotonic() - t0:.3f}s")
+            return result
+        except Exception:
+            _omni_rpc_log("collective_rpc.ERROR", f"method={method_name} elapsed={time.monotonic() - t0:.3f}s")
+            logger.exception("collective_rpc failed for method=%s", method_name)
+            raise
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -504,13 +622,20 @@ class vLLMOmniHttpServer:
             _unwrap_first(diffusion_output.get("negative_prompt_embeds_mask")) if isinstance(diffusion_output, dict) else None
         )
 
+        # Ray may deserialize ImageOutput on a CPU-only actor process. Move tensor
+        # payloads to CPU before returning across actor boundaries.
+        def _to_cpu_if_tensor(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu()
+            return value
+
         extra_fields = {
-            "all_latents": all_latents,
-            "all_timesteps": all_timesteps,
-            "prompt_embeds": prompt_embeds,
-            "prompt_embeds_mask": prompt_embeds_mask,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "negative_prompt_embeds_mask": negative_prompt_embeds_mask,
+            "all_latents": _to_cpu_if_tensor(all_latents),
+            "all_timesteps": _to_cpu_if_tensor(all_timesteps),
+            "prompt_embeds": _to_cpu_if_tensor(prompt_embeds),
+            "prompt_embeds_mask": _to_cpu_if_tensor(prompt_embeds_mask),
+            "negative_prompt_embeds": _to_cpu_if_tensor(negative_prompt_embeds),
+            "negative_prompt_embeds_mask": _to_cpu_if_tensor(negative_prompt_embeds_mask),
         }
 
         # Determine stop reason from finish_reason

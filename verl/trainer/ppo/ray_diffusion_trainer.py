@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -57,12 +58,15 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.profiler import log_stage_gpu_memory
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import embeds_padding_2_no_padding
+
+logger = logging.getLogger(__file__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -246,6 +250,9 @@ class RayFlowGRPOTrainer:
             return
         elapsed = time.monotonic() - start
         self._stage_log(stage, f"{message} elapsed={elapsed:.3f}s")
+
+    def _mem_log(self, stage: str, event: str, **context):
+        log_stage_gpu_memory("TRAIN_MEM", stage, event, logger=logger, **context)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1279,6 +1286,7 @@ class RayFlowGRPOTrainer:
                 timing_raw = {}
 
                 print(f"Start the {i}th batch_dict, with size: {len(batch_dict)}")
+                self._mem_log("BATCH", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1304,17 +1312,21 @@ class RayFlowGRPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        self._mem_log("GEN", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         self._stage_start(f"Start gen of the epoch: {epoch}, batch: {i}")
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         print(f"Finished generation!")
                         self._stage_end(f"Start gen of the epoch: {epoch}, batch: {i}")
+                        self._mem_log("GEN", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
                         print(
                             "[SLEEP_TRACE][ROLLOUT][BEFORE] training rollout generation finished, sleep_replicas.",
                             flush=True,
                         )
+                        self._mem_log("ROLLOUT_SLEEP_REPLICAS", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                         self.checkpoint_manager.sleep_replicas()
+                        self._mem_log("ROLLOUT_SLEEP_REPLICAS", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
                         print(
                             "[SLEEP_TRACE][ROLLOUT][AFTER] training sleep_replicas completed.",
                             flush=True,
@@ -1348,6 +1360,7 @@ class RayFlowGRPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        self._mem_log("REWARD", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
@@ -1355,6 +1368,7 @@ class RayFlowGRPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        self._mem_log("REWARD", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1372,6 +1386,7 @@ class RayFlowGRPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            self._mem_log("OLD_LOG_PROB", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             old_log_prob = self._compute_old_log_prob(batch)
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
@@ -1379,22 +1394,28 @@ class RayFlowGRPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                            self._mem_log("OLD_LOG_PROB", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            self._mem_log("REF_LOG_PROB", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                            self._mem_log("REF_LOG_PROB", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
+                            self._mem_log("VALUES", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             values = self._compute_values(batch)
                             batch = batch.union(values)
+                            self._mem_log("VALUES", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        self._mem_log("ADV", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
@@ -1438,11 +1459,14 @@ class RayFlowGRPOTrainer:
                             global_std=self.config.algorithm.global_std,
                             config=self.config.algorithm,
                         )
+                        self._mem_log("ADV", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            self._mem_log("UPDATE_CRITIC", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             critic_output = self._update_critic(batch)
+                            self._mem_log("UPDATE_CRITIC", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
@@ -1450,7 +1474,9 @@ class RayFlowGRPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            self._mem_log("UPDATE_ACTOR", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             actor_output = self._update_actor(batch)
+                            self._mem_log("UPDATE_ACTOR", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1472,11 +1498,15 @@ class RayFlowGRPOTrainer:
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._mem_log("SAVE_CHECKPOINT", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                                 self._save_checkpoint()
+                                self._mem_log("SAVE_CHECKPOINT", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
+                            self._mem_log("UPDATE_WEIGHTS", "BEFORE", epoch=epoch, batch=i, global_steps=self.global_steps)
                             self.checkpoint_manager.update_weights()
+                            self._mem_log("UPDATE_WEIGHTS", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

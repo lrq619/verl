@@ -50,7 +50,6 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.rollout.sde_window_range="[0,5]" \
     +actor_rollout_ref.model.vae_scale_factor=4 \
     actor_rollout_ref.rollout.val_kwargs.num_inference_steps=1 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.custom_pipeline=verl.utils.vllm_omni.pipelines.QwenImagePipelineWithLogProb \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
     reward.reward_manager.name=image \
     reward.reward_model.model_path=$reward_model_name \

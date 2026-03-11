@@ -60,6 +60,43 @@ def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
     return mem_allocated, mem_reserved, mem_used, mem_total
 
 
+def format_visible_gpu_memory(precision: int = 2) -> str:
+    """Format visible GPU memory usage as `cuda:i=used/totalGB` for each device."""
+    if not torch.cuda.is_available():
+        return "no_visible_gpu"
+
+    try:
+        stats = []
+        for idx in range(torch.cuda.device_count()):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+            used_bytes = total_bytes - free_bytes
+            stats.append(
+                f"cuda:{idx}={used_bytes / (1024**3):.{precision}f}/{total_bytes / (1024**3):.{precision}f}GB"
+            )
+        return ", ".join(stats) if stats else "no_visible_gpu"
+    except Exception as e:  # noqa: BLE001
+        return f"gpu_mem_error={e!r}"
+
+
+def log_stage_gpu_memory(
+    category: str,
+    stage: str,
+    event: str,
+    logger: logging.Logger | None = None,
+    level: int = logging.WARNING,
+    **context,
+):
+    """Log GPU memory usage with a structured stage prefix."""
+    context_message = " ".join(f"{key}={value}" for key, value in context.items())
+    if context_message:
+        context_message += " "
+    message = f"[{category}][{stage}][{event}] {context_message}gpu_mem={format_visible_gpu_memory()}"
+    if logger is None:
+        print(message, flush=True)
+    else:
+        logger.log(level=level, msg=message)
+
+
 def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
     """Log GPU memory usage information.
 

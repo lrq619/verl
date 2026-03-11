@@ -40,7 +40,13 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    ProfilerConfig,
+    log_gpu_memory_usage,
+    log_stage_gpu_memory,
+)
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
@@ -55,6 +61,10 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 def _sync_log(stage: str, message: str):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + "Z"
     print(f"[WorkerSync][{ts}][{stage}] {message}", flush=True)
+
+
+def _sync_mem_log(stage: str, event: str, **context):
+    log_stage_gpu_memory("SYNC_MEM", stage, event, logger=logger, **context)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -656,6 +666,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return
 
         set_expandable_segments(False)
+        _sync_mem_log(
+            "ROLLOUT_RESUME_WEIGHTS",
+            "BEFORE",
+            rank=rank,
+            role=self.role,
+            free_cache_engine=self.config.rollout.free_cache_engine,
+        )
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume weights and update weights
@@ -667,10 +684,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 f"{stage_prefix}/rollout.resume(weights)",
                 f"END elapsed={time.monotonic() - t_resume_weights:.3f}s",
             )
+        _sync_mem_log(
+            "ROLLOUT_RESUME_WEIGHTS",
+            "AFTER",
+            rank=rank,
+            role=self.role,
+            free_cache_engine=self.config.rollout.free_cache_engine,
+        )
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. get per tensor generator from engine, this will load model to gpu
         t_get_params = time.monotonic()
+        _sync_mem_log("ENGINE_GET_PER_TENSOR_PARAM", "BEFORE", rank=rank, role=self.role, base_sync_done=True)
         _sync_log(f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=True)", "START")
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
@@ -679,14 +704,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=True)",
             f"END elapsed={time.monotonic() - t_get_params:.3f}s peft_config={'yes' if peft_config is not None else 'no'}",
         )
+        _sync_mem_log(
+            "ENGINE_GET_PER_TENSOR_PARAM",
+            "AFTER",
+            rank=rank,
+            role=self.role,
+            base_sync_done=True,
+            peft_config="yes" if peft_config is not None else "no",
+        )
 
         t_rollout_update = time.monotonic()
+        _sync_mem_log("ROLLOUT_UPDATE_WEIGHTS", "BEFORE", rank=rank, role=self.role, base_sync_done=True)
         _sync_log(f"{stage_prefix}/rollout.update_weights(base_sync_done=True)", "START")
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=True)
         _sync_log(
             f"{stage_prefix}/rollout.update_weights(base_sync_done=True)",
             f"END elapsed={time.monotonic() - t_rollout_update:.3f}s",
         )
+        _sync_mem_log("ROLLOUT_UPDATE_WEIGHTS", "AFTER", rank=rank, role=self.role, base_sync_done=True)
 
         do_lora_base_sync = False
         if not self.peft_merge and peft_config is not None:
@@ -701,6 +736,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if do_lora_base_sync:
             t_get_base = time.monotonic()
+            _sync_mem_log("ENGINE_GET_PER_TENSOR_PARAM", "BEFORE", rank=rank, role=self.role, base_sync_done=False)
             _sync_log(f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=False)", "START")
             per_tensor_base_params, _ = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
@@ -709,32 +745,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 f"{stage_prefix}/engine.get_per_tensor_param(base_sync_done=False)",
                 f"END elapsed={time.monotonic() - t_get_base:.3f}s",
             )
+            _sync_mem_log("ENGINE_GET_PER_TENSOR_PARAM", "AFTER", rank=rank, role=self.role, base_sync_done=False)
             t_rollout_update_base = time.monotonic()
+            _sync_mem_log("ROLLOUT_UPDATE_WEIGHTS", "BEFORE", rank=rank, role=self.role, base_sync_done=False)
             _sync_log(f"{stage_prefix}/rollout.update_weights(base_sync_done=False)", "START")
             await self.rollout.update_weights(per_tensor_base_params, peft_config=peft_config, base_sync_done=False)
             _sync_log(
                 f"{stage_prefix}/rollout.update_weights(base_sync_done=False)",
                 f"END elapsed={time.monotonic() - t_rollout_update_base:.3f}s",
             )
+            _sync_mem_log("ROLLOUT_UPDATE_WEIGHTS", "AFTER", rank=rank, role=self.role, base_sync_done=False)
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
         t_to_cpu = time.monotonic()
+        _sync_mem_log("ACTOR_ENGINE_TO_CPU", "BEFORE", rank=rank, role=self.role)
         _sync_log(f"{stage_prefix}/actor.engine.to(cpu)", "START")
         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
         _sync_log(f"{stage_prefix}/actor.engine.to(cpu)", f"END elapsed={time.monotonic() - t_to_cpu:.3f}s")
+        _sync_mem_log("ACTOR_ENGINE_TO_CPU", "AFTER", rank=rank, role=self.role)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
             t_resume_kv = time.monotonic()
+            _sync_mem_log("ROLLOUT_RESUME_KV_CACHE", "BEFORE", rank=rank, role=self.role)
             _sync_log(f"{stage_prefix}/rollout.resume(kv_cache)", "START")
             await self.rollout.resume(tags=["kv_cache"])
             _sync_log(
                 f"{stage_prefix}/rollout.resume(kv_cache)",
                 f"END elapsed={time.monotonic() - t_resume_kv:.3f}s",
             )
+            _sync_mem_log("ROLLOUT_RESUME_KV_CACHE", "AFTER", rank=rank, role=self.role)
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True

@@ -100,7 +100,10 @@ RUN uv pip install --python "${VENV}/bin/python" --upgrade pip setuptools wheel
 
 RUN uv pip install --python "${VENV}/bin/python" vllm==0.16.0
 
-RUN git clone https://github.com/lrq619/vllm-omni.git /workspace/vllm-omni && \
+# Manually bump this value to force rebuilding the vllm-omni layer.
+ARG VLLM_OMNI_VERSION=2026.03.10
+RUN echo "Building vllm-omni version: ${VLLM_OMNI_VERSION}" && \
+    git clone https://github.com/lrq619/vllm-omni.git /workspace/vllm-omni && \
     cd /workspace/vllm-omni && \
     git checkout verl-train && \
     uv pip install --python "${VENV}/bin/python" -e .

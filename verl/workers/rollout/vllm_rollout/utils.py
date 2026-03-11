@@ -409,6 +409,12 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
     def __new__(cls, **kwargs):
         set_death_signal()
+        logger.warning(
+            "[OMNI_WORKER_EXT][__new__] cls=%s pid=%s kwargs_keys=%s",
+            cls.__name__,
+            os.getpid(),
+            sorted(kwargs.keys()),
+        )
 
         # 1. patch for Lora
         VLLMOmniHijack.hijack()
@@ -426,6 +432,13 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         start_time = time.time()
         log_prefix = f"{self.__class__.__name__}.update_weights_from_ipc/device={self.device}"
         _worker_sync_log(log_prefix, f"START peft={peft_config is not None} base_sync_done={base_sync_done} use_shm={use_shm}")
+        logger.warning(
+            "[OMNI_WORKER_EXT][update_weights_from_ipc.START] pid=%s device=%s local_rank=%s has_model_runner=%s",
+            os.getpid(),
+            self.device,
+            getattr(self, "local_rank", None),
+            hasattr(self, "model_runner"),
+        )
         from vllm.platforms import current_platform
 
         if current_platform.device_type == "npu" and self.device is None:
@@ -440,6 +453,12 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         if not hasattr(self, "_zmq_ctx") or self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
         socket = self._zmq_ctx.socket(zmq.REP)
+        logger.warning(
+            "[OMNI_WORKER_EXT][zmq_socket] pid=%s device=%s handle=%s",
+            os.getpid(),
+            self.device,
+            self._get_zmq_handle(),
+        )
         socket.connect(self._get_zmq_handle())
         _worker_sync_log(log_prefix, f"zmq_connect={self._get_zmq_handle()}")
 
