@@ -45,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-num-batched-tokens", type=int, default=8192)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.2)
     p.add_argument("--tensor-parallel-size", type=int, default=1)
+    p.add_argument("--ulysses_degree", type=int, default=1)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--scheduling-policy", default="fcfs")
     p.add_argument("--compilation-config", default='{"cudagraph_mode":"NONE"}')
@@ -111,8 +112,14 @@ def _build_verl_like_args(args: argparse.Namespace) -> list[str]:
 
     # Exactly like verl's `args = {..., **engine_kwargs}`.
     config.update(engine_kwargs)
+    cli_args = ["serve", args.model] + build_cli_args_from_config(config)
 
-    return ["serve", args.model] + build_cli_args_from_config(config)
+    # vLLM-Omni expects hyphenated diffusion SP flags. Preserve verl-like config
+    # building for standard args, then append the exact spellings the parser accepts.
+    if args.ulysses_degree is not None:
+        cli_args.extend(["--ulysses-degree", str(args.ulysses_degree)])
+
+    return cli_args
 
 
 def _parse_and_validate_with_vllm_omni(cli_args: list[str]) -> argparse.Namespace:
@@ -251,6 +258,18 @@ async def _dummy_request_and_report(engine_client: AsyncOmni) -> None:
 async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
     engine_args = AsyncOmniEngineArgs.from_cli_args(ns)
     engine_args = asdict(engine_args)
+
+    # AsyncOmniEngineArgs does not currently retain diffusion-only SP fields,
+    # but AsyncOmni still accepts them as kwargs.
+    if getattr(ns, "ulysses_degree", None) is not None:
+        engine_args["ulysses_degree"] = ns.ulysses_degree
+    if getattr(ns, "ring_degree", None) is not None:
+        engine_args["ring_degree"] = ns.ring_degree
+
+    print(
+        f"tp_size: {engine_args['tensor_parallel_size']}, "
+        f"ulysses_size: {engine_args.get('ulysses_degree')}"
+    )
     engine_client = AsyncOmni(**engine_args)
 
     print("[OK] AsyncOmni initialized")
