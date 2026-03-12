@@ -1255,9 +1255,9 @@ class RayFlowGRPOTrainer:
             rollout_skip.wrap_generate_sequences()
 
         # add tqdm
-        print(f"Before progress bar")
-        # progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-        print(f"After progress bar")
+        # print(f"Before progress bar")
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        # print(f"After progress bar")
 
         # we start from step 1
         self.global_steps += 1
@@ -1568,7 +1568,7 @@ class RayFlowGRPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                # progress_bar.update(1)
+                progress_bar.update(1)
                 self.global_steps += 1
 
                 if (
@@ -1583,7 +1583,7 @@ class RayFlowGRPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
-                    # progress_bar.close()
+                    progress_bar.close()
                     return
 
                 # this is experimental and may be changed/removed in the future
