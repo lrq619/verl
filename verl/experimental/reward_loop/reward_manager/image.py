@@ -55,7 +55,6 @@ class ImageRewardManager(RewardManagerBase):
             if self.reward_router_address is not None
             else {}
         )
-        print(f"[Reward] extra reward kwargs: {extra_reward_kwargs}")
         if self.is_async_reward_score:
             result = await self.compute_score(
                 data_source=data_source,
@@ -83,6 +82,9 @@ class ImageRewardManager(RewardManagerBase):
             score = result["score"]
             for key, value in result.items():
                 reward_extra_info[key] = value
+            identified_words = result.get("genrm_response")
+            if identified_words is not None:
+                print(f"[Reward] identified words: {identified_words}, expected words: {ground_truth}, score: {score}")
         else:
             score = result
             reward_extra_info["acc"] = score
