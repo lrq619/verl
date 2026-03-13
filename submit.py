@@ -18,7 +18,7 @@ def main():
 
     # 控制可见的 GPU 设备
     os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
-    os.environ["CKP_DIR"] = "/data/oss_bucket_0/borui/ckp"
+    os.environ["CKP_DIR"] = "/data/oss_bucket_0/borui/ckp_1"
 
     # vLLM RPC 超时时间（秒）
     os.environ["VERL_VLLM_RPC_TIMEOUT_S"] = "600"
@@ -30,7 +30,7 @@ def main():
     # ============================================================
     # 启动训练脚本
     # ============================================================
-    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_flowgrpo_nebul.sh")
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_flowgrpo_tp1_nebul.sh")
 
     print(f"[submit] Launching {script_path} ...")
     result = subprocess.run(
