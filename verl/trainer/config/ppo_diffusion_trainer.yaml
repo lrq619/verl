@@ -161,6 +161,21 @@ trainer:
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 
+  # Settings for dumping low-reward rollout samples during training
+  low_reward_rollout_dump:
+
+    # Whether to dump low-reward rollout samples
+    enabled: False
+
+    # Base directory for low-reward rollout dumps
+    base_dir: ./logs
+
+    # Save rollout samples whose score is below this threshold
+    score_threshold: 0.05
+
+    # Maximum number of low-reward images to save for each training step
+    max_images_per_step: 50
+
   # Number of nodes used in the training
   nnodes: 1
 

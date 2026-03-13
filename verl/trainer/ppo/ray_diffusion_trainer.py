@@ -232,6 +232,7 @@ class RayFlowGRPOTrainer:
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self._stage_start_times: dict[str, float] = {}
+        self._low_reward_rollout_dump_root: Optional[str] = None
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -253,6 +254,36 @@ class RayFlowGRPOTrainer:
 
     def _mem_log(self, stage: str, event: str, **context):
         log_stage_gpu_memory("TRAIN_MEM", stage, event, logger=logger, **context)
+
+    def _get_low_reward_rollout_dump_cfg(self) -> Optional[dict[str, Any]]:
+        dump_cfg = self.config.trainer.get("low_reward_rollout_dump", None)
+        if dump_cfg is None or not dump_cfg.get("enabled", False):
+            return None
+
+        base_dir = dump_cfg.get("base_dir", "./logs")
+        max_images_per_step = int(dump_cfg.get("max_images_per_step", 50))
+        if not base_dir or max_images_per_step <= 0:
+            return None
+
+        return {
+            "base_dir": base_dir,
+            "score_threshold": float(dump_cfg.get("score_threshold", 0.05)),
+            "max_images_per_step": max_images_per_step,
+        }
+
+    def _get_low_reward_rollout_dump_root(self, base_dir: str) -> str:
+        if self._low_reward_rollout_dump_root is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._low_reward_rollout_dump_root = os.path.join(base_dir, timestamp)
+        return self._low_reward_rollout_dump_root
+
+    def _decode_batch_prompts(self, batch: DataProto) -> list[str]:
+        prompt_token_ids = batch.batch["prompts"] if "prompts" in batch.batch else batch.batch["input_ids"]
+        return self.tokenizer.batch_decode(prompt_token_ids, skip_special_tokens=True)
+
+    def _tensor_to_uint8_images(self, outputs: torch.Tensor) -> np.ndarray:
+        images = outputs.detach().cpu().float().permute(0, 2, 3, 1).numpy()
+        return (images * 255).round().clip(0, 255).astype("uint8")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -344,8 +375,7 @@ class RayFlowGRPOTrainer:
         os.makedirs(visual_folder, exist_ok=True)
 
         output_paths = []
-        images_pil = outputs.cpu().float().permute(0, 2, 3, 1).numpy()
-        images_pil = (images_pil * 255).round().clip(0, 255).astype("uint8")
+        images_pil = self._tensor_to_uint8_images(outputs)
         for i, image in enumerate(images_pil):
             image_path = os.path.join(visual_folder, f"{i}.jpg")
             Image.fromarray(image).save(image_path)
@@ -376,6 +406,67 @@ class RayFlowGRPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _maybe_dump_low_reward_rollout_samples(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        timing_raw: dict[str, float],
+    ) -> None:
+        dump_cfg = self._get_low_reward_rollout_dump_cfg()
+        if dump_cfg is None:
+            return
+
+        with marked_timer("dump_low_reward_rollout", timing_raw, color="green"):
+            try:
+                scores = reward_tensor.sum(-1).detach().cpu().tolist()
+                low_reward_indices = [idx for idx, score in enumerate(scores) if score < dump_cfg["score_threshold"]]
+                if not low_reward_indices:
+                    return
+
+                low_reward_indices.sort(key=lambda idx: scores[idx])
+                total_low_reward_count = len(low_reward_indices)
+                low_reward_indices = low_reward_indices[: dump_cfg["max_images_per_step"]]
+
+                step_dir = os.path.join(
+                    self._get_low_reward_rollout_dump_root(dump_cfg["base_dir"]),
+                    f"step_{self.global_steps}",
+                )
+                os.makedirs(step_dir, exist_ok=True)
+
+                prompts = self._decode_batch_prompts(batch)
+                images = self._tensor_to_uint8_images(batch.batch["responses"][low_reward_indices])
+                uids = batch.non_tensor_batch.get("uid")
+
+                metadata_lines = []
+                for image_idx, (batch_idx, image) in enumerate(zip(low_reward_indices, images, strict=True)):
+                    image_name = f"{image_idx:03d}_sample_{batch_idx:04d}.jpg"
+                    Image.fromarray(image).save(os.path.join(step_dir, image_name))
+
+                    metadata = {
+                        "step": self.global_steps,
+                        "batch_index": batch_idx,
+                        "image": image_name,
+                        "prompt": prompts[batch_idx],
+                        "score": float(scores[batch_idx]),
+                    }
+                    if uids is not None:
+                        metadata["uid"] = str(uids[batch_idx])
+                    metadata_lines.append(json.dumps(metadata, ensure_ascii=False))
+
+                metadata_path = os.path.join(step_dir, "metadata.jsonl")
+                with open(metadata_path, "w") as f:
+                    f.write("\n".join(metadata_lines) + "\n")
+
+                logger.info(
+                    "Dumped %s/%s low-reward rollout samples below %.4f to %s",
+                    len(low_reward_indices),
+                    total_low_reward_count,
+                    dump_cfg["score_threshold"],
+                    step_dir,
+                )
+            except Exception:
+                logger.exception("Failed to dump low-reward rollout samples at step %s", self.global_steps)
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -387,7 +478,7 @@ class RayFlowGRPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            inputs = self._decode_batch_prompts(batch)
             outputs = batch.batch["responses"]
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
@@ -1369,6 +1460,8 @@ class RayFlowGRPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
                         self._mem_log("REWARD", "AFTER", epoch=epoch, batch=i, global_steps=self.global_steps)
+
+                    self._maybe_dump_low_reward_rollout_samples(batch, reward_tensor, timing_raw)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
