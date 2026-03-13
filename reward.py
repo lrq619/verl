@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import inspect
 import json
 import pprint
 import shlex
 import sys
+import urllib.request
+from io import BytesIO
 from typing import Any
 
 import torch
@@ -108,6 +111,16 @@ def parse_args() -> argparse.Namespace:
         default="validate",
         help="print: only print args; validate: parse/validate; init: initialize engine then sleep/wake; "
         "serve: initialize engine, sleep/wake, then start vLLM serve.",
+    )
+    parser.add_argument(
+        "--dummy-vl-check",
+        action="store_true",
+        help="After starting the server in serve mode, send one small base64 image OCR request and print the result.",
+    )
+    parser.add_argument(
+        "--dummy-vl-text",
+        default="HELLO123",
+        help="Ground-truth text rendered into the dummy VL image when --dummy-vl-check is enabled.",
     )
     return parser.parse_args()
 
@@ -250,7 +263,72 @@ async def _wake_up_engine(engine_client: Any, tags: list[str] | None = None) -> 
         await engine_client.reset_prefix_cache()
 
 
-async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
+def _normalize_for_ocr(text: str) -> str:
+    return "".join(text.split()).lower()
+
+
+def _pil_image_to_data_url(image: Any) -> str:
+    buffered = BytesIO()
+    image.save(buffered, format="PNG")
+    encoded = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _build_dummy_vl_payload(model_name: str, expected_text: str) -> tuple[dict[str, Any], str]:
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (320, 120), color="white")
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    draw.text((24, 44), expected_text, fill="black", font=font)
+
+    query = [
+        {"type": "image_url", "image_url": {"url": _pil_image_to_data_url(image)}},
+        {
+            "type": "text",
+            "text": "Please output only the text content from the image without any additional descriptions or formatting.",
+        },
+    ]
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": query},
+        ],
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "max_tokens": 64,
+    }
+    return payload, expected_text
+
+
+def _post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url=url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=None) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+async def _run_dummy_vl_check(host: str, port: int, model_name: str, expected_text: str) -> None:
+    payload, expected = _build_dummy_vl_payload(model_name, expected_text)
+    url = f"http://{host}:{port}/v1/chat/completions"
+    print(f"[DUMMY_VL] sending OCR request to {url}")
+    print(f"[DUMMY_VL] expected_text={expected}")
+    output = await asyncio.to_thread(_post_json, url, payload)
+    actual = output["choices"][0]["message"]["content"]
+    normalized_expected = _normalize_for_ocr(expected)
+    normalized_actual = _normalize_for_ocr(actual)
+    score = 1.0 if normalized_expected and normalized_expected in normalized_actual else 0.0
+    print(f"[DUMMY_VL] response_text={actual!r}")
+    print(f"[DUMMY_VL] score={score:.3f}")
+
+
+async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str, dummy_vl_check: bool, dummy_vl_text: str) -> None:
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.entrypoints.openai.api_server import build_app, init_app_state
     from vllm.usage.usage_lib import UsageContext
@@ -308,6 +386,8 @@ async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
 
     port, _ = await run_unvicorn(app, ns, host)
     print(f"[OK] Serving at http://{host}:{port}")
+    if dummy_vl_check:
+        await _run_dummy_vl_check(host, port, ns.model, dummy_vl_text)
     await asyncio.Event().wait()
 
 
@@ -331,7 +411,7 @@ def main() -> None:
 
     print("\n[OK] vLLM parser accepted args.")
     if args.mode in {"init", "serve"}:
-        asyncio.run(_init_or_serve(ns, args.mode, args.host))
+        asyncio.run(_init_or_serve(ns, args.mode, args.host, args.dummy_vl_check, args.dummy_vl_text))
 
 
 if __name__ == "__main__":
