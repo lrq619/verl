@@ -720,9 +720,9 @@ class vLLMOmniHttpServer:
         )
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            await self.engine.sleep(level=2)
+            await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.COLOCATED:
-            await self.engine.sleep(level=2)
+            await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 

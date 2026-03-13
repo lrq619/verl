@@ -274,10 +274,10 @@ async def _init_or_serve(ns: argparse.Namespace, mode: str, host: str) -> None:
 
     print("[OK] AsyncOmni initialized")
     print(f"[SLEEP_MEM][SIM][BEFORE_WAIT] gpu_mem={_format_gpu_memory_used_total_gb()}")
-    print("[SLEEP_MEM][SIM] waiting 3 seconds before calling engine.sleep(level=2)")
+    print("[SLEEP_MEM][SIM] waiting 3 seconds before calling engine.sleep(level=1)")
     await asyncio.sleep(3)
     print(f"[SLEEP_MEM][SIM][BEFORE_SLEEP] gpu_mem={_format_gpu_memory_used_total_gb()}")
-    await _sleep_engine(engine_client, level=2)
+    await _sleep_engine(engine_client, level=1)
     print(f"[SLEEP_MEM][SIM][AFTER_SLEEP] gpu_mem={_format_gpu_memory_used_total_gb()}")
     print("[SLEEP_MEM][SIM] waiting 3 seconds before calling engine.wake_up(...)")
     await asyncio.sleep(3)

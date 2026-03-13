@@ -729,8 +729,8 @@ class vLLMHttpServer:
         )
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # Don't use engine.sleep(level=2) here
-            await self.engine.collective_rpc("sleep", kwargs={"level": 2})
+            # Use sleep level=1 here to avoid the rollout replica issues seen with level=2
+            await self.engine.collective_rpc("sleep", kwargs={"level": 1})
 
             # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452
             # await self.engine.reset_encoder_cache()
