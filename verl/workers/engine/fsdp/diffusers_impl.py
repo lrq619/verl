@@ -505,7 +505,7 @@ class DiffusersFSDPEngine(BaseEngine):
             max_reserved_fn = getattr(device, "max_memory_reserved", None)
             max_reserved_gb = max_reserved_fn() / 1024**3 if callable(max_reserved_fn) else reserved_gb
             device_used_gb = alloc_gb
-            logger.info(
+            logger.warning(
                 "roll/fsdp2_diffusion oom_probe: worker=%s step=%s stage=%s alloc_gb=%.3f reserved_gb=%.3f max_reserved_gb=%.3f device_used_gb=%.3f",
                 self._oom_probe_worker_name(),
                 step,
@@ -523,6 +523,18 @@ class DiffusersFSDPEngine(BaseEngine):
                 stage,
             )
             raise
+
+    def _log_oom_probe_activation_once(self):
+        if getattr(self, "_roll_oom_probe_activation_logged", False):
+            return
+        self._roll_oom_probe_activation_logged = True
+        marker = (
+            f"[ROLL_OOM_PROBE_ACTIVE] DiffusersFSDPEngine.forward_step logging is active "
+            f"on worker={self._oom_probe_worker_name()} rank={self.rank}"
+        )
+        logger.warning(marker)
+        # Print once to make activation obvious even when logging handlers are filtered/misconfigured.
+        print(marker, flush=True)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
@@ -739,11 +751,12 @@ class DiffusersFSDPEngine(BaseEngine):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
+        self._log_oom_probe_activation_once()
 
         all_latents = micro_batch["all_latents"]
         all_timesteps = micro_batch["all_timesteps"]
         model_gradient_checkpointing = self._oom_probe_model_gradient_checkpointing()
-        logger.info(
+        logger.warning(
             "roll/fsdp2_diffusion oom_probe: worker=%s stage=forward_call_context "
             "model_training=%s grad_enabled=%s autocast_enabled=%s param_dtype=%s "
             "fsdp_size_cfg=%s cp_size=%s dp_size=%s dp_rank=%s "
@@ -774,7 +787,7 @@ class DiffusersFSDPEngine(BaseEngine):
         if not hasattr(self, "_roll_stepwise_forward_log_count"):
             self._roll_stepwise_forward_log_count = 0
         if self._roll_stepwise_forward_log_count < 20:
-            logger.info(
+            logger.warning(
                 "roll/fsdp2_diffusion stepwise_forward enabled: bsz=%s num_steps=%s seq_len=%s channels=%s worker=%s",
                 bsz,
                 num_steps,
@@ -790,7 +803,7 @@ class DiffusersFSDPEngine(BaseEngine):
             model_inputs, negative_model_inputs = self.prepare_model_inputs(micro_batch=micro_batch, step=step)
             step_img_shapes = model_inputs.get("img_shapes", []) or []
             step_txt_seq_lens = model_inputs.get("txt_seq_lens", []) or []
-            logger.info(
+            logger.warning(
                 "roll/fsdp2_diffusion oom_probe: worker=%s step=%s stage=before_model_forward_input "
                 "hidden_shape=%s hidden_dtype=%s prompt_shape=%s prompt_dtype=%s prompt_mask_shape=%s prompt_mask_dtype=%s "
                 "timestep_shape=%s timestep_dtype=%s img_shapes_len=%s img_shapes_first=%s txt_seq_lens_len=%s txt_seq_lens_min=%s txt_seq_lens_max=%s "
