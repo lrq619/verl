@@ -36,7 +36,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -487,6 +487,43 @@ class DiffusersFSDPEngine(BaseEngine):
         else:
             return torch.distributed.group.WORLD
 
+    def _oom_probe_worker_name(self) -> str:
+        return str(getattr(self, "worker_name", f"rank_{self.rank}"))
+
+    def _oom_probe_model_gradient_checkpointing(self):
+        return getattr(
+            self.module,
+            "is_gradient_checkpointing",
+            getattr(self.module, "gradient_checkpointing", None),
+        )
+
+    def _log_step_mem(self, stage: str, step: int):
+        try:
+            device = get_torch_device()
+            alloc_gb = device.memory_allocated() / 1024**3
+            reserved_gb = device.memory_reserved() / 1024**3
+            max_reserved_fn = getattr(device, "max_memory_reserved", None)
+            max_reserved_gb = max_reserved_fn() / 1024**3 if callable(max_reserved_fn) else reserved_gb
+            device_used_gb = alloc_gb
+            logger.info(
+                "roll/fsdp2_diffusion oom_probe: worker=%s step=%s stage=%s alloc_gb=%.3f reserved_gb=%.3f max_reserved_gb=%.3f device_used_gb=%.3f",
+                self._oom_probe_worker_name(),
+                step,
+                stage,
+                alloc_gb,
+                reserved_gb,
+                max_reserved_gb,
+                device_used_gb,
+            )
+        except Exception:
+            logger.exception(
+                "roll/fsdp2_diffusion oom_probe logging failed: worker=%s step=%s stage=%s",
+                self._oom_probe_worker_name(),
+                step,
+                stage,
+            )
+            raise
+
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
@@ -702,11 +739,106 @@ class DiffusersFSDPEngine(BaseEngine):
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
-        model_inputs, negative_model_inputs = self.prepare_model_inputs(micro_batch=micro_batch, step=step)
-        raw_output = self.forward_model_with_scheduler(
-            model_inputs=model_inputs, negative_model_inputs=negative_model_inputs, micro_batch=micro_batch, step=step
+
+        all_latents = micro_batch["all_latents"]
+        all_timesteps = micro_batch["all_timesteps"]
+        model_gradient_checkpointing = self._oom_probe_model_gradient_checkpointing()
+        logger.info(
+            "roll/fsdp2_diffusion oom_probe: worker=%s stage=forward_call_context "
+            "model_training=%s grad_enabled=%s autocast_enabled=%s param_dtype=%s "
+            "fsdp_size_cfg=%s cp_size=%s dp_size=%s dp_rank=%s "
+            "offload_policy_cfg=%s reshard_after_forward_cfg=%s "
+            "gradient_checkpointing=%s all_latents_shape=%s all_latents_dtype=%s "
+            "all_timesteps_shape=%s all_timesteps_dtype=%s meta_keys=%s",
+            self._oom_probe_worker_name(),
+            bool(getattr(self.module, "training", False)),
+            torch.is_grad_enabled(),
+            torch.is_autocast_enabled(),
+            str(getattr(self, "param_dtype", None)),
+            getattr(self.engine_config, "fsdp_size", None),
+            None,
+            tu.get_non_tensor_data(micro_batch, "dp_size", None),
+            self.get_data_parallel_rank(),
+            getattr(self.engine_config, "offload_policy", None),
+            getattr(self.engine_config, "reshard_after_forward", None),
+            model_gradient_checkpointing,
+            tuple(all_latents.shape),
+            str(all_latents.dtype),
+            tuple(all_timesteps.shape),
+            str(all_timesteps.dtype),
+            sorted(str(k) for k in micro_batch.keys()),
         )
-        model_output = self.prepare_model_outputs(output=raw_output, micro_batch=micro_batch)
+
+        cur_latents = all_latents[:, :-1]
+        bsz, num_steps, seq_len, channels = cur_latents.shape
+        if not hasattr(self, "_roll_stepwise_forward_log_count"):
+            self._roll_stepwise_forward_log_count = 0
+        if self._roll_stepwise_forward_log_count < 20:
+            logger.info(
+                "roll/fsdp2_diffusion stepwise_forward enabled: bsz=%s num_steps=%s seq_len=%s channels=%s worker=%s",
+                bsz,
+                num_steps,
+                seq_len,
+                channels,
+                self._oom_probe_worker_name(),
+            )
+            self._roll_stepwise_forward_log_count += 1
+
+        self._log_step_mem("step_begin", step)
+        stage = "prepare_step_inputs"
+        try:
+            model_inputs, negative_model_inputs = self.prepare_model_inputs(micro_batch=micro_batch, step=step)
+            step_img_shapes = model_inputs.get("img_shapes", []) or []
+            step_txt_seq_lens = model_inputs.get("txt_seq_lens", []) or []
+            logger.info(
+                "roll/fsdp2_diffusion oom_probe: worker=%s step=%s stage=before_model_forward_input "
+                "hidden_shape=%s hidden_dtype=%s prompt_shape=%s prompt_dtype=%s prompt_mask_shape=%s prompt_mask_dtype=%s "
+                "timestep_shape=%s timestep_dtype=%s img_shapes_len=%s img_shapes_first=%s txt_seq_lens_len=%s txt_seq_lens_min=%s txt_seq_lens_max=%s "
+                "model_training=%s grad_enabled=%s autocast_enabled=%s gradient_checkpointing=%s "
+                "micro_batch_size_meta=%s global_valid_samples_meta=%s batch_num_tokens_meta=%s",
+                self._oom_probe_worker_name(),
+                step,
+                tuple(model_inputs["hidden_states"].shape),
+                str(model_inputs["hidden_states"].dtype),
+                tuple(model_inputs["encoder_hidden_states"].shape),
+                str(model_inputs["encoder_hidden_states"].dtype),
+                tuple(model_inputs["encoder_hidden_states_mask"].shape),
+                str(model_inputs["encoder_hidden_states_mask"].dtype),
+                tuple(model_inputs["timestep"].shape),
+                str(model_inputs["timestep"].dtype),
+                len(step_img_shapes),
+                step_img_shapes[0] if len(step_img_shapes) > 0 else None,
+                len(step_txt_seq_lens),
+                min(step_txt_seq_lens) if len(step_txt_seq_lens) > 0 else None,
+                max(step_txt_seq_lens) if len(step_txt_seq_lens) > 0 else None,
+                bool(getattr(self.module, "training", False)),
+                torch.is_grad_enabled(),
+                torch.is_autocast_enabled(),
+                model_gradient_checkpointing,
+                tu.get_non_tensor_data(micro_batch, "micro_batch_size", None),
+                tu.get_non_tensor_data(micro_batch, "global_valid_samples", None),
+                tu.get_non_tensor_data(micro_batch, "batch_num_tokens", None),
+            )
+
+            self._log_step_mem("before_model_forward", step)
+            stage = "model_forward_call"
+            raw_output = self.forward_model_with_scheduler(
+                model_inputs=model_inputs, negative_model_inputs=negative_model_inputs, micro_batch=micro_batch, step=step
+            )
+            self._log_step_mem("after_model_forward", step)
+            stage = "extract_and_validate_output"
+            model_output = self.prepare_model_outputs(output=raw_output, micro_batch=micro_batch)
+            self._log_step_mem("after_append_step_output", step)
+        except Exception:
+            logger.exception(
+                "roll/fsdp2_diffusion stepwise_forward failed: worker=%s step=%s stage=%s bsz=%s num_steps=%s",
+                self._oom_probe_worker_name(),
+                step,
+                stage,
+                bsz,
+                num_steps,
+            )
+            raise
 
         if loss_function is not None:
             data = tu.get_tensordict(
