@@ -72,7 +72,7 @@ class Tracking:
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
-            self.logger["wandb"] = wandb
+            self.logger["wandb"] = _WandbLoggingAdapter(wandb)
 
         if "trackio" in default_backend:
             import trackio
@@ -142,7 +142,7 @@ class Tracking:
                 config=config,
                 sync_tensorboard=True,
             )
-            self.logger["vemlp_wandb"] = vemlp_wandb
+            self.logger["vemlp_wandb"] = _WandbLoggingAdapter(vemlp_wandb)
 
         if "tensorboard" in default_backend:
             self.logger["tensorboard"] = _TensorboardAdapter(project_name, experiment_name)
@@ -307,6 +307,28 @@ class _MlflowLoggingAdapter:
 
         results = {sanitize_key(k): v for k, v in data.items()}
         mlflow.log_metrics(metrics=results, step=step)
+
+
+class _WandbLoggingAdapter:
+    """Adapter for wandb-compatible backends.
+
+    When logging with an explicit `step`, wandb may buffer records unless `commit=True`.
+    We force commit by default to make each training step visible immediately.
+    """
+
+    def __init__(self, wandb_module):
+        self.wandb = wandb_module
+        self._commit = os.environ.get("VERL_WANDB_COMMIT", "1") != "0"
+
+    def log(self, data, step):
+        self.wandb.log(data=data, step=step, commit=self._commit)
+
+    def finish(self, exit_code=0):
+        # keep signature compatible with both wandb and vemlp_wandb
+        try:
+            self.wandb.finish(exit_code=exit_code)
+        except TypeError:
+            self.wandb.finish()
 
 
 def _compute_mlflow_params_from_objects(params) -> dict[str, Any]:

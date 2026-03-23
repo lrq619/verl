@@ -78,6 +78,46 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
+def _compute_group_advantage_metrics(
+    batch: DataProto, advantages: torch.Tensor, response_mask: torch.Tensor
+) -> dict[str, Any]:
+    """Compute per-group (uid) advantage metrics.
+
+    Grouping is based on ``batch.non_tensor_batch["uid"]``. For each sample, we first
+    reduce token-level advantages to a scalar by masked mean over response positions,
+    then report per-group mean/std.
+    """
+    if "uid" not in batch.non_tensor_batch:
+        return {}
+
+    uids = batch.non_tensor_batch["uid"]
+    if len(uids) != advantages.shape[0]:
+        return {}
+
+    # Reduce token-level advantages to per-sample scalar advantage.
+    scalar_advantages = verl_F.masked_mean(advantages, response_mask, axis=-1)
+    scalar_advantages = scalar_advantages.detach().float().cpu()
+
+    uid_to_values: dict[str, list[float]] = {}
+    uid_order: list[str] = []
+    for idx, uid in enumerate(uids):
+        uid_key = str(uid)
+        if uid_key not in uid_to_values:
+            uid_to_values[uid_key] = []
+            uid_order.append(uid_key)
+        uid_to_values[uid_key].append(float(scalar_advantages[idx].item()))
+
+    metrics: dict[str, Any] = {"critic/advantages_group/count": len(uid_order)}
+    for group_idx, uid_key in enumerate(uid_order):
+        group_tensor = torch.tensor(uid_to_values[uid_key], dtype=torch.float32)
+        metrics[f"critic/advantages_group/{group_idx}/mean"] = group_tensor.mean().item()
+        metrics[f"critic/advantages_group/{group_idx}/std"] = (
+            group_tensor.std(unbiased=False).item() if group_tensor.numel() > 1 else 0.0
+        )
+
+    return metrics
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
@@ -221,6 +261,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    metrics.update(_compute_group_advantage_metrics(batch=batch, advantages=advantages, response_mask=response_mask))
 
     return metrics
 
