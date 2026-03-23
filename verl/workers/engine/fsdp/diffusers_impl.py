@@ -19,6 +19,7 @@ import gc
 import json
 import logging
 import os
+import time
 import warnings
 from contextlib import contextmanager, nullcontext
 from typing import Callable, Optional
@@ -729,7 +730,40 @@ class DiffusersFSDPEngine(BaseEngine):
         latents = micro_batch["all_latents"]
         timesteps = micro_batch["all_timesteps"]
 
+        step_latents = model_inputs["hidden_states"]
+        prompt_embeds = model_inputs["encoder_hidden_states"]
+        prompt_embeds_mask = model_inputs["encoder_hidden_states_mask"]
+        step_timesteps = model_inputs["timestep"]
+        step_img_shapes = model_inputs.get("img_shapes", []) or []
+        step_txt_seq_lens = model_inputs.get("txt_seq_lens", []) or []
+
+        forward_start = time.perf_counter()
         noise_pred = self.module(**model_inputs)[0]
+        forward_ms = (time.perf_counter() - forward_start) * 1000.0
+        worker_name = getattr(getattr(self, "worker", None), "worker_name", getattr(self, "worker_name", "unknown"))
+        logger.warning(
+            "verl/fsdp2_diffusion forward_time: worker=%s path=train_step_forward step=%s elapsed_ms=%.3f "
+            "hidden_shape=%s hidden_dtype=%s prompt_shape=%s prompt_dtype=%s "
+            "prompt_mask_shape=%s prompt_mask_dtype=%s timestep_shape=%s timestep_dtype=%s "
+            "img_shapes_len=%s img_shapes_first=%s txt_seq_lens_len=%s txt_seq_lens_min=%s txt_seq_lens_max=%s",
+            worker_name,
+            step,
+            forward_ms,
+            tuple(step_latents.shape),
+            str(step_latents.dtype),
+            tuple(prompt_embeds.shape),
+            str(prompt_embeds.dtype),
+            tuple(prompt_embeds_mask.shape),
+            str(prompt_embeds_mask.dtype),
+            tuple(step_timesteps.shape),
+            str(step_timesteps.dtype),
+            len(step_img_shapes),
+            step_img_shapes[0] if len(step_img_shapes) > 0 else None,
+            len(step_txt_seq_lens),
+            min(step_txt_seq_lens) if len(step_txt_seq_lens) > 0 else None,
+            max(step_txt_seq_lens) if len(step_txt_seq_lens) > 0 else None,
+        )
+
         if self._guidance_scale > 1.0:
             neg_noise_pred = self.module(**negative_model_inputs)[0]
             comb_pred = neg_noise_pred + self._guidance_scale * (noise_pred - neg_noise_pred)
